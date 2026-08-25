@@ -1,6 +1,6 @@
 # pontonier
 
-Pontonier is the shared core library for agent-bridge MCP servers. An
+Pontonier is the shared core library for cross-model agent-bridge MCP servers. An
 agent bridge lets one agent harness call an agent that runs on a
 different model. Three bridges use this library:
 
