@@ -1,7 +1,7 @@
 [project]
 name = "pontonier"
 version = "0.6.0"
-description = "Shared core library for agent-bridge MCP servers (codex-in-claude, moonbridge, claude-in-codex)"
+description = "Shared core library for cross-model agent-bridge MCP servers (codex-in-claude, moonbridge, claude-in-codex)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

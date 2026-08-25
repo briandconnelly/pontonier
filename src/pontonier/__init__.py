@@ -1,4 +1,4 @@
-"""Pontonier: shared core library for agent-bridge MCP servers.
+"""Pontonier: shared core library for cross-model agent-bridge MCP servers.
 
 The supported public surface in this release is ``pontonier.core`` (see its
 docstring for the module inventory) and ``pontonier.conventions`` /
