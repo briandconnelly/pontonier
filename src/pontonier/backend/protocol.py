@@ -38,6 +38,14 @@ class RunRequest:
     concept ignore them. ``extra_args`` are operator-supplied descriptors
     already vetted against the contract's ExtraArgsPolicy. ``sanitize_aliases``
     are the worktree path aliases used to scrub prose in results and errors.
+    ``instructions_append`` is caller-supplied text, already normalized and
+    bounded by the bridge, that the backend composes into the model's
+    developer/system-level instructions AFTER the bridge's own framing; it
+    never rides argv as a second flag and is never sent unframed. The library
+    carries it verbatim — normalization, caps, and framing are bridge policy.
+    ``None`` means no caller text and no developer/system override; backends
+    that lack the concept ignore it, like ``config_mode``/``access``. It is
+    NOT an ``extra_args`` descriptor: that channel is operator-owned.
     """
 
     kind: str
@@ -53,6 +61,7 @@ class RunRequest:
     isolation: str | None = None
     extra_args: tuple[str, ...] = ()
     sanitize_aliases: tuple[str, ...] = ()
+    instructions_append: str | None = None
 
 
 @dataclass(frozen=True)
