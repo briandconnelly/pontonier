@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from pathlib import Path
 
 import pytest
 from tests.test_conformance_fakes import ClaudeLikeBackend, CodexLikeBackend, KimiLikeBackend
@@ -86,14 +87,29 @@ async def test_adapters_without_the_concept_ignore_it(backend_cls: type):
     # backend that lacks the concept ignores the field. The reference fakes predate it,
     # so a set value must leave their staged argv and stdin exactly as when it is unset.
     backend = backend_cls()
+    sentinel = "CALLER-TEXT-SENTINEL-7f3a"
     plain = _request()
-    with_text = _request(instructions_append="caller text")
+    with_text = _request(instructions_append=sentinel)
     async with backend.prepare(plain) as a, backend.prepare(with_text) as b:
         # Per-run temp paths (last-message, schema, handshake files) differ by design;
-        # mask every absolute path so the two argv lists compare structurally.
-        def shape(argv: tuple[str, ...]) -> list[str]:
-            return [re.sub(r"/\S+", "<path>", tok) for tok in argv]
+        # mask every absolute path so the staged runs compare structurally.
+        def mask(value: object) -> object:
+            if isinstance(value, str):
+                return re.sub(r"/\S+", "<path>", value)
+            if isinstance(value, tuple):
+                return tuple(mask(v) for v in value)
+            if isinstance(value, dict):
+                return {k: mask(v) for k, v in value.items()}
+            return value
 
-        assert shape(a.argv) == shape(b.argv)
-        assert a.stdin_text == b.stdin_text
-        assert "caller text" not in " ".join(b.argv)
+        # Every PreparedRun channel, not just argv/stdin: env and staged artifacts are
+        # the other places an adapter could start leaking the text.
+        for name in ("argv", "env", "cwd", "stdin_text", "orphan_marker", "dropped_flags"):
+            assert mask(getattr(a, name)) == mask(getattr(b, name)), name
+        assert mask(a.artifact_paths) == mask(b.artifact_paths)
+        assert len(a.artifacts) == len(b.artifacts)
+        staged = "\n".join(Path(path).read_text() for path in b.artifacts if Path(path).is_file())
+        assert sentinel not in " ".join(b.argv)
+        assert sentinel not in " ".join(b.env.values())
+        assert sentinel not in (b.stdin_text or "")
+        assert sentinel not in staged

@@ -20,7 +20,8 @@ This file is decision history, not current policy. Rules that still bind live in
   dishonest `allowed_option_forms` entry so the conformance kit accepts the adapter's own
   descriptor. The library carries the text verbatim: normalization, the byte cap, the
   forged-marker refusal, the framing prose, and the fingerprint a bridge reports are bridge
-  policy. `None` means no caller text and no override; adapters that lack the concept ignore
+  policy, and so is whatever instructions or guardrails a bridge sends on its own — `None`
+  means only that no caller-supplied text was given. Adapters that lack the concept ignore
   it, as they do `config_mode`/`access`. A defaulted field is what the v1 freeze permits;
   `CONTRACT_API_VERSION` stays 1. Adoption: codex-in-claude#558, claude-in-codex#132.
 
