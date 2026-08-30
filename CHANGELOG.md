@@ -6,7 +6,7 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This file is decision history, not current policy. Rules that still bind live in
 [AGENTS.md](AGENTS.md) and the documents it links.
 
-## [Unreleased]
+## [0.7.0] — 2026-08-30
 
 ### Added
 
