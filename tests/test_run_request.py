@@ -11,10 +11,15 @@ import re
 from pathlib import Path
 
 import pytest
-from tests.test_conformance_fakes import ClaudeLikeBackend, CodexLikeBackend, KimiLikeBackend
+from tests.test_conformance_fakes import (
+    ClaudeLikeBackend,
+    CodexLikeBackend,
+    KimiLikeBackend,
+    make_run,
+)
 
 from pontonier.backend import CONTRACT_API_VERSION
-from pontonier.backend.protocol import RunRequest
+from pontonier.backend.protocol import RunOutcome, RunRequest
 
 
 def _request(**overrides: object) -> RunRequest:
@@ -108,8 +113,44 @@ async def test_adapters_without_the_concept_ignore_it(backend_cls: type):
             assert mask(getattr(a, name)) == mask(getattr(b, name)), name
         assert mask(a.artifact_paths) == mask(b.artifact_paths)
         assert len(a.artifacts) == len(b.artifacts)
-        staged = "\n".join(Path(path).read_text() for path in b.artifacts if Path(path).is_file())
-        assert sentinel not in " ".join(b.argv)
-        assert sentinel not in " ".join(b.env.values())
-        assert sentinel not in (b.stdin_text or "")
-        assert sentinel not in staged
+
+        # The mask above could hide a sentinel embedded in a path-shaped value, so the
+        # absence check walks every UNMASKED string leaf of the staged run, plus the
+        # contents of every staged text file.
+        def leaves(value: object) -> list[str]:
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, (tuple, list)):
+                return [leaf for v in value for leaf in leaves(v)]
+            if isinstance(value, dict):
+                return [leaf for v in value.values() for leaf in leaves(v)]
+            return []
+
+        for leaf in leaves(dataclasses.asdict(b)):
+            assert sentinel not in leaf
+        for path in b.artifacts:
+            if Path(path).is_file():
+                assert sentinel not in Path(path).read_text()
+
+    # The rest of the lifecycle must ignore the field too: identical outcomes must
+    # validate, finalize, and classify identically whether or not the field is set.
+    outcome = RunOutcome(run=make_run(exit_code=1, stderr="boom"), events="")
+    assert backend.validate_request(with_text) == backend.validate_request(plain)
+    assert backend.classify_failure(outcome, with_text) == backend.classify_failure(outcome, plain)
+    # Each fake parses success from a different channel, so give each a well-formed
+    # success outcome in its own dialect.
+    ok_by_backend = {
+        CodexLikeBackend: RunOutcome(
+            run=make_run(exit_code=0), events="", artifact_texts={"last-message": "fine"}
+        ),
+        KimiLikeBackend: RunOutcome(
+            run=make_run(exit_code=0),
+            events='{"role": "assistant", "content": "fine"}\n',
+        ),
+        ClaudeLikeBackend: RunOutcome(
+            run=make_run(exit_code=0, stdout='{"result": "fine", "subtype": "success"}'),
+            events="",
+        ),
+    }
+    ok = ok_by_backend[backend_cls]
+    assert backend.finalize(ok, with_text) == backend.finalize(ok, plain)
