@@ -6,6 +6,25 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This file is decision history, not current policy. Rules that still bind live in
 [AGENTS.md](AGENTS.md) and the documents it links.
 
+## [Unreleased]
+
+### Added
+
+- `RunRequest.instructions_append` (#12): a defaulted field for caller-supplied text a
+  bridge composes into the model's developer/system-level instructions *behind* its own
+  framing. Both bridges with a system-prompt/developer-instructions parameter had been
+  pressing `RunRequest.extra_args` into service as the carrier (claude-in-codex#130 folds an
+  `("--append-system-prompt", text)` pair in `prepare()`; codex-in-claude#556 was about to
+  do the same with `-c developer_instructions`), which misstates that channel — the protocol
+  defines `extra_args` as operator descriptors vetted by `ExtraArgsPolicy` — and forces a
+  dishonest `allowed_option_forms` entry so the conformance kit accepts the adapter's own
+  descriptor. The library carries the text verbatim: normalization, the byte cap, the
+  forged-marker refusal, the framing prose, and the fingerprint a bridge reports are bridge
+  policy, and so is whatever instructions or guardrails a bridge sends on its own — `None`
+  means only that no caller-supplied text was given. Adapters that lack the concept ignore
+  it, as they do `config_mode`/`access`. A defaulted field is what the v1 freeze permits;
+  `CONTRACT_API_VERSION` stays 1. Adoption: codex-in-claude#558, claude-in-codex#132.
+
 ## [0.6.0] — 2026-08-20
 
 ### Added
