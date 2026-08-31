@@ -115,3 +115,18 @@ def test_missing_expected_flags_empty_when_probe_failed(monkeypatch):
     _stub_run(monkeypatch, missing=True)
     p = _probe()
     assert p.missing_expected_flags(p.flag_support()) == []
+
+
+def test_flag_support_fails_open_when_the_cli_cannot_be_executed(tmp_path, monkeypatch):
+    """The in-repo caller of the broken contract (#16).
+
+    _probe_help promises '"" on any failure (callers fail open)'. A CLI on PATH that
+    cannot be executed — here a directory with the binary's name — used to escape
+    run_sync_capture as a raised PermissionError and take flag_support with it.
+    """
+    entry = tmp_path / "path"
+    (entry / "fakecli").mkdir(parents=True)
+    monkeypatch.setenv("PATH", str(entry))
+    assert _probe().flag_support() == preflight.FlagSupport(
+        supported=frozenset(), help_parsed=False
+    )
