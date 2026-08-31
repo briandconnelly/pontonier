@@ -6,6 +6,33 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This file is decision history, not current policy. Rules that still bind live in
 [AGENTS.md](AGENTS.md) and the documents it links.
 
+## [Unreleased]
+
+### Fixed
+
+- `runtime.run_sync_capture` now classifies every spawn failure as `binary_missing`
+  instead of raising (#16). It caught only `FileNotFoundError` and `NotADirectoryError`,
+  and wrapped the whole `subprocess.run` lifecycle in that one `try`, so a binary that is
+  present but cannot be executed — a directory with the binary's name on `PATH`, a file
+  without the execute bit, an ENOEXEC file — escaped as a raised `OSError` from a function
+  whose docstring promises a `CommandRun` and the same shape as `run_async`. `run_async`
+  already caught `OSError` around `Popen` alone and classified all of them. The in-repo
+  caller broke on the same edge: `preflight.HelpProbe.flag_support` promises to fail open
+  and instead propagated the `PermissionError`.
+
+  The fix isolates the spawn from the drain, rather than widening the existing `except`:
+  the single `try` covered both phases, so nothing inside or outside the function could
+  tell a failed exec from a failed pipe read, and a widened clause would have reported a
+  communicate failure as a missing binary. A communicate-phase error still propagates,
+  after the child is killed and its pipes are closed — dropping `subprocess.run` means
+  reproducing the cleanup its `with Popen(...)` performed on every exit path.
+
+  **Bridges:** `BINARY_NOT_FOUND` marks the whole spawn phase, not only an absent binary —
+  it already covered an unusable `cwd` before this change. A bridge that turns
+  `binary_missing` into "install the CLI" advice may want to widen that wording.
+  `codex-in-claude` can drop the downstream `errno`+`OSError.filename` heuristic it carries
+  for this (codex-in-claude#541) once it pins a release containing this fix.
+
 ## [0.7.0] — 2026-08-30
 
 ### Added

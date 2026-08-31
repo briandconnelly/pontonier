@@ -43,7 +43,11 @@ _OBSERVER_QUEUE_BYTES = 8 * 1024 * 1024
 # never stdout, the stdio JSON-RPC channel.
 logger = logging.getLogger(__name__)
 
-# stderr sentinel returned when the binary is not on PATH (spawn raised OSError).
+# stderr sentinel returned when the process could not be STARTED (spawn raised OSError).
+# Named for its dominant cause — the binary is not on PATH — but it marks the whole spawn
+# phase, so it also covers a binary that cannot be executed (a directory, no execute bit,
+# ENOEXEC) and an unusable cwd. Both runners classify spawn failures identically; callers
+# branch on CommandRun.binary_missing and treat it as "this command could not be run".
 BINARY_NOT_FOUND = "__binary_not_found__"
 # stderr sentinel returned when the run exceeded its timeout and was killed.
 TIMED_OUT = "__timed_out__"
@@ -489,24 +493,59 @@ def run_sync_capture(
     """Blocking variant for cheap, local probes (version/help/auth/git).
 
     Returns a CommandRun with binary_missing/timed_out set rather than raising, so
-    callers can branch on the same shape as run_async."""
+    callers can branch on the same shape as run_async. The two phases are spawned and
+    drained under separate try blocks because only this function can tell them apart: a
+    failure to start the process is a BINARY_NOT_FOUND fact, while a failure while
+    draining its pipes is neither that nor a timeout, and is left to propagate rather
+    than be misreported as a missing binary. A caller outside this function sees no
+    phase information and can only guess.
+
+    Errors other than a spawn failure or a timeout still raise."""
     start = time.monotonic()
+
+    def elapsed_ms() -> int:
+        return int((time.monotonic() - start) * 1000)
+
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=cwd,
-            capture_output=True,
+            # Match subprocess.run(input=None): with no stdin_text the child inherits
+            # this process's stdin rather than receiving an immediate EOF.
+            stdin=subprocess.PIPE if stdin_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
+            encoding="utf-8",
             env=env,
-            input=stdin_text,
         )
-    except (FileNotFoundError, NotADirectoryError):
-        elapsed = int((time.monotonic() - start) * 1000)
-        return CommandRun("", BINARY_NOT_FOUND, 127, elapsed, False)
-    except subprocess.TimeoutExpired:
-        elapsed = int((time.monotonic() - start) * 1000)
-        return CommandRun("", TIMED_OUT, -9, elapsed, True)
-    elapsed = int((time.monotonic() - start) * 1000)
-    return CommandRun(proc.stdout or "", proc.stderr or "", proc.returncode, elapsed, False)
+    except OSError:
+        # Every way exec can fail, matching run_async: the binary is absent, is a
+        # directory, has no execute bit, or is not an executable format (ENOEXEC), and
+        # cwd is unusable. See BINARY_NOT_FOUND on what this sentinel does and does not
+        # claim.
+        logger.debug("spawn failed: %s", cmd[0])
+        return CommandRun("", BINARY_NOT_FOUND, 127, elapsed_ms(), False)
+
+    # `with proc` mirrors subprocess.run's `with Popen(...)`: on every exit — return,
+    # timeout, or a propagating error — it closes the three pipe objects and waits, so
+    # dropping subprocess.run does not start leaking file descriptors and children.
+    with proc:
+        try:
+            out, err = proc.communicate(stdin_text, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            # kill() then wait(), not a second communicate(): a descendant that inherited
+            # a pipe can keep communicate() blocked with no deadline left to bound it,
+            # while wait() returns as soon as the killed child is reaped. This is what
+            # subprocess.run does on POSIX. Killing only the direct child is deliberate —
+            # a probe is a cheap local command, and run_async owns process-group teardown.
+            proc.kill()
+            proc.wait()
+            return CommandRun("", TIMED_OUT, -9, elapsed_ms(), True)
+        except BaseException:
+            # subprocess.run's bare `except:` — a drain failure propagates (only spawn
+            # failures and timeouts are CommandRun facts), but it must not also leave the
+            # child running.
+            proc.kill()
+            raise
+    return CommandRun(out or "", err or "", proc.returncode, elapsed_ms(), False)

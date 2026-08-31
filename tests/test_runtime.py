@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import subprocess
 import sys
+import time
 
 import anyio
 import pytest
@@ -584,3 +586,191 @@ def test_kill_group_kills_descendants_after_leader_exits():
     assert drained[0], "proc.stdout.read() should have reached EOF after _kill_group"
     proc.stdout.close()  # type: ignore[union-attr]
     proc.stderr.close()  # type: ignore[union-attr]
+
+
+# --- Spawn-failure classification (#16) -------------------------------------------------
+# run_sync_capture promises a CommandRun rather than a raise, and promises the same shape
+# as run_async. Both promises broke for every spawn failure that is not FileNotFoundError
+# or NotADirectoryError: an executable directory on PATH, an ENOEXEC file, and a file
+# without the execute bit all escaped as raised OSErrors.
+
+
+def _path_with(tmp_path, name: str, kind: str) -> str:
+    """A PATH entry holding `name` in a shape that makes exec fail at spawn."""
+    entry = tmp_path / f"path-{kind}"
+    entry.mkdir()
+    target = entry / name
+    if kind == "directory":
+        # shutil.which excludes directories, so this is reachable only when the caller
+        # passes a bare name and lets subprocess do its own PATH lookup. -> EACCES.
+        target.mkdir()
+    elif kind == "enoexec":
+        target.write_bytes(b"\x00\x01\x02 not a binary, no shebang\n")
+        target.chmod(0o755)
+    elif kind == "no_exec_bit":
+        target.write_text("#!/bin/sh\necho hi\n")
+        target.chmod(0o644)
+    else:  # pragma: no cover - guards a typo in a test parameter
+        raise AssertionError(f"unknown kind {kind!r}")
+    return str(entry)
+
+
+SPAWN_FAILURE_KINDS = ["directory", "enoexec", "no_exec_bit"]
+
+posix_spawn_failures = pytest.mark.skipif(
+    os.name != "posix", reason="exec-permission spawn failures are POSIX-specific"
+)
+
+
+@posix_spawn_failures
+@pytest.mark.parametrize("kind", SPAWN_FAILURE_KINDS)
+def test_run_sync_capture_spawn_failure_is_binary_missing(tmp_path, monkeypatch, kind):
+    monkeypatch.setenv("PATH", _path_with(tmp_path, "faketool", kind))
+    run = runtime.run_sync_capture(["faketool", "--version"], timeout_seconds=10)
+    assert run.binary_missing
+    assert run.exit_code == 127
+    assert not run.timed_out
+
+
+@posix_spawn_failures
+@pytest.mark.parametrize("kind", SPAWN_FAILURE_KINDS)
+async def test_run_async_spawn_failure_is_binary_missing(tmp_path, monkeypatch, kind):
+    monkeypatch.setenv("PATH", _path_with(tmp_path, "faketool", kind))
+    run = await runtime.run_async(["faketool", "--version"], cwd=str(tmp_path), timeout_seconds=10)
+    assert run.binary_missing
+    assert run.exit_code == 127
+
+
+@posix_spawn_failures
+@pytest.mark.parametrize("kind", [*SPAWN_FAILURE_KINDS, "missing"])
+async def test_spawn_failure_classification_is_identical_across_both_runners(
+    tmp_path, monkeypatch, kind
+):
+    """The parity the docstring promises: 'callers can branch on the same shape'."""
+    if kind == "missing":
+        monkeypatch.setenv("PATH", str(tmp_path))
+        cmd = ["definitely-not-a-real-binary-xyz"]
+    else:
+        monkeypatch.setenv("PATH", _path_with(tmp_path, "faketool", kind))
+        cmd = ["faketool"]
+    sync_run = runtime.run_sync_capture(cmd, timeout_seconds=10)
+    async_run = await runtime.run_async(cmd, cwd=str(tmp_path), timeout_seconds=10)
+    assert (sync_run.binary_missing, sync_run.exit_code, sync_run.timed_out) == (
+        async_run.binary_missing,
+        async_run.exit_code,
+        async_run.timed_out,
+    )
+
+
+def test_run_sync_capture_unusable_cwd_is_a_spawn_failure(tmp_path):
+    """A cwd that is not a directory fails at spawn, not at communicate."""
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_text("x")
+    run = runtime.run_sync_capture(
+        [sys.executable, "-c", "pass"], timeout_seconds=10, cwd=str(not_a_dir)
+    )
+    assert run.binary_missing
+    assert run.exit_code == 127
+
+
+def test_run_sync_capture_communicate_failure_is_not_reported_as_binary_missing(monkeypatch):
+    """Guard against 'fix' by widening the existing except over the whole lifecycle.
+
+    A pipe failure while draining output is not a missing binary; reporting it as one
+    sends the caller down the wrong repair path. It must escape rather than be
+    misclassified, so the spawn and communicate phases need separate try blocks.
+    """
+
+    def boom(self, *args, **kwargs):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", boom)
+    with pytest.raises(OSError, match="Input/output error"):
+        runtime.run_sync_capture([sys.executable, "-c", "print('ok')"], timeout_seconds=10)
+
+
+def test_run_sync_capture_stdin_is_inherited_when_no_stdin_text(tmp_path):
+    """No stdin_text means the child inherits this process's stdin, as subprocess.run
+    does with input=None. A rewrite that always pipes would silently give the child an
+    immediate EOF instead."""
+    try:
+        mine = os.fstat(0)
+    except OSError:  # pragma: no cover - only if the runner closed its own stdin
+        pytest.skip("this process has no stdin to inherit")
+    # Identity of the open file, not its kind: asserting "not a FIFO" would fail whenever
+    # the test runner's own stdin is a pipe, and asserting on the Popen argument would
+    # test the call rather than the child.
+    run = runtime.run_sync_capture(
+        _py("import os; s = os.fstat(0); print(s.st_dev, s.st_ino)"), timeout_seconds=10
+    )
+    assert run.stdout.strip() == f"{mine.st_dev} {mine.st_ino}"
+
+
+def test_run_sync_capture_stdin_text_is_delivered():
+    run = runtime.run_sync_capture(
+        _py("import sys; sys.stdout.write(sys.stdin.read().upper())"),
+        timeout_seconds=10,
+        stdin_text="abc",
+    )
+    assert run.stdout == "ABC"
+
+
+def _spy_on_popen(monkeypatch) -> list[subprocess.Popen]:
+    """Record every Popen run_sync_capture creates, while still spawning for real.
+
+    The child object is the only place the post-run facts live — whether it was reaped
+    and whether its pipes were closed. A marker search in `ps` cannot stand in for this:
+    a zombie is listed as `<defunct>` with no argv, so it never matches a marker and the
+    assertion passes whether or not the child was reaped.
+    """
+    spawned: list[subprocess.Popen] = []
+    real = subprocess.Popen
+
+    class Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", Spy)
+    return spawned
+
+
+def _pipes_closed(proc: subprocess.Popen) -> bool:
+    return all(p is None or p.closed for p in (proc.stdin, proc.stdout, proc.stderr))
+
+
+def test_run_sync_capture_timeout_reaps_the_child_and_closes_its_pipes(monkeypatch):
+    """subprocess.run killed and reaped on timeout, and its `with Popen(...)` closed the
+    pipes. A hand-rolled Popen must do both, or the probe leaves a zombie and leaks fds."""
+    spawned = _spy_on_popen(monkeypatch)
+    run = runtime.run_sync_capture(_py("import time; time.sleep(30)"), timeout_seconds=2)
+    assert run.timed_out
+    assert run.stderr == runtime.TIMED_OUT
+    assert run.exit_code == -9
+    (proc,) = spawned
+    assert proc.returncode is not None, "child was killed but never reaped"
+    assert _pipes_closed(proc), "pipes left open after the timeout"
+
+
+def test_run_sync_capture_kills_and_closes_when_the_drain_raises(monkeypatch):
+    """subprocess.run's bare `except:` killed the child, and its `with` block closed the
+    pipes, before letting the error propagate. Letting a drain error escape must not also
+    leak the process and its fds."""
+    spawned = _spy_on_popen(monkeypatch)
+    real_communicate = subprocess.Popen.communicate
+
+    def boom(self, *args, **kwargs):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(runtime.subprocess.Popen, "communicate", boom)
+    started = time.monotonic()
+    with pytest.raises(OSError, match="Input/output error"):
+        runtime.run_sync_capture(_py("import time; time.sleep(30)"), timeout_seconds=10)
+    elapsed = time.monotonic() - started
+    (proc,) = spawned
+    monkeypatch.setattr(runtime.subprocess.Popen, "communicate", real_communicate)
+    # Without the kill the child is not leaked — it is worse: closing the Popen waits for
+    # the full 30s sleep, so an unbounded hang is the symptom to pin, not a stray process.
+    assert elapsed < 10, f"propagating the drain error blocked for {elapsed:.1f}s"
+    assert proc.returncode is not None, "child left running after the drain failed"
+    assert _pipes_closed(proc), "pipes leaked after the drain failed"
