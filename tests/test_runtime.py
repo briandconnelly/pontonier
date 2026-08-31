@@ -838,37 +838,129 @@ async def test_a_multibyte_character_split_across_writes_is_not_corrupted(tmp_pa
     assert run.stdout == "aéb\n"
 
 
-@pytest.mark.skipif(os.name != "posix", reason="a bytes argv is POSIX-specific")
-def test_the_orphan_sweep_survives_an_undecodable_command_line():
+def _fake_ps(tmp_path, line_bytes: bytes) -> str:
+    """A PATH entry whose `ps` emits exactly `line_bytes`.
+
+    `_ps_matches` invokes `ps` by bare name, so a fake one ahead of it on PATH exercises
+    the real decode path deterministically. The alternative — a real process with an
+    undecodable argv — depends on whether the platform's own `ps` passes the raw byte
+    through, which macOS does and the CI Linux runners do not.
+    """
+    entry = tmp_path / "fakebin"
+    entry.mkdir()
+    script = entry / "ps"
+    script.write_bytes(
+        b"#!" + sys.executable.encode() + b"\n"
+        b"import sys\n"
+        b"sys.stdout.buffer.write(" + repr(line_bytes).encode() + b")\n"
+    )
+    script.chmod(0o755)
+    return str(entry)
+
+
+def test_the_orphan_sweep_survives_an_undecodable_command_line(tmp_path, monkeypatch):
     """_ps_matches documents 'Returns [] on any failure — a sweep is best-effort cleanup
-    and must never raise into the caller's error path'. A process whose argv holds a
-    non-UTF-8 byte appears in `ps` output for every sweep on the machine, not only for
-    the run that owns it, so one such process broke teardown for every run."""
+    and must never raise into the caller's error path'. It reads the command line of every
+    process on the machine, so one unrelated program started with a non-UTF-8 argv made it
+    raise — breaking teardown for every run, not only the one that owned that process."""
     marker = "sweep-marker-undecodable"
-    # A bytes argv reaches execv unencoded; a str would be encoded to valid UTF-8 and the
-    # undecodable byte this test needs would never exist. `executable` is what puts the
-    # marker in argv[0] — passing it as args[0] alone would make it sleep's time argument,
-    # and sleep would reject it and exit before any sweep could see it.
+    line = b"4242 4242 " + marker.encode() + b"-\xff --flag\n"
+    monkeypatch.setenv("PATH", _fake_ps(tmp_path, line) + os.pathsep + os.environ["PATH"])
+    assert runtime.find_orphans(marker) == [4242]
+
+
+def test_the_orphan_sweep_still_finds_ordinary_processes_through_the_fake_ps(tmp_path, monkeypatch):
+    """Instrument check for the test above: the fake `ps` is actually consulted, and a
+    clean line is matched. Without this, a fake that emitted nothing usable would make the
+    undecodable case look handled when it was simply never scanned."""
+    marker = "sweep-marker-plain"
+    monkeypatch.setenv(
+        "PATH",
+        _fake_ps(tmp_path, b"4243 4243 " + marker.encode() + b" --flag\n")
+        + os.pathsep
+        + os.environ["PATH"],
+    )
+    assert runtime.find_orphans(marker) == [4243]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a bytes argv is POSIX-specific")
+def test_a_real_process_with_an_undecodable_argv_does_not_break_the_sweep():
+    """The same contract against the platform's real `ps`, for the platforms that pass an
+    undecodable byte through. Skipped where `ps` sanitizes it, because the condition under
+    test cannot occur there — never asserted away as a pass."""
+    marker = "sweep-marker-real-undecodable"
+    # `executable` is what puts the marker in argv[0]; as args[0] alone it would be sleep's
+    # time argument, and sleep would reject it and exit before any sweep could see it.
     proc = subprocess.Popen([marker.encode() + b"-\xff", b"5"], executable=b"/bin/sleep")
     try:
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not _raw_ps_contains(marker):
+        while time.monotonic() < deadline and not _raw_ps_contains(marker.encode()):
             time.sleep(0.05)
-        assert _raw_ps_contains(marker), "the undecodable process never reached ps output"
-        assert runtime.find_orphans(marker)
+        if not _raw_ps_contains(marker.encode()):
+            pytest.fail("the process never reached ps output at all")
+        if not _raw_ps_contains(marker.encode() + b"-\xff"):
+            pytest.skip("this platform's ps does not surface the raw undecodable byte")
+        # Membership, not equality: a shell that echoed this file carries the marker in
+        # its own command line and legitimately matches too.
+        assert proc.pid in runtime.find_orphans(marker)
     finally:
         proc.kill()
         proc.wait()
 
 
-def _raw_ps_contains(marker: str) -> bool:
-    """Confirm the marker is in raw ps BYTES — the guard that keeps the test above honest.
-    Without it the test passes when the process failed to start and nothing was scanned.
+def _raw_ps_contains(needle: bytes) -> bool:
+    """Whether `needle` appears in raw ps BYTES.
 
-    Searches for the marker followed by the RAW undecodable byte, not the marker alone: a
-    test runner started from a shell that echoed this file has the marker in its own
-    command line, where the byte appears as the four characters ``\xff``. Matching the
-    marker alone therefore reports success from the harness's own argv while the child is
-    dead."""
+    Callers pass the marker plus the RAW undecodable byte when they mean to detect the
+    child: a test runner started from a shell that echoed this file carries the marker in
+    its own command line, where the byte appears as the four characters ``\xff``, so
+    matching the marker alone reports success from the harness's own argv.
+    """
     raw = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, check=False).stdout
-    return marker.encode() + b"-\xff" in raw
+    return needle in raw
+
+
+# --- Pump-thread failure is visible (#18) -----------------------------------------------
+# errors="replace" removed the one known way a pump thread could die, but not the shape it
+# produced: any exception in a pump left a success-shaped CommandRun with the output gone.
+
+
+async def test_a_dead_stdout_pump_is_reported_rather_than_read_as_empty_output(
+    tmp_path, monkeypatch
+):
+    """The gap errors="replace" does not close: a pump can still die for another reason,
+    and 'the command produced no output' must stay distinguishable from 'the output was
+    lost'. Simulated at the capture boundary because every real cause is now fixed."""
+    real = runtime.streamcap.iter_bounded_lines
+
+    def fail_on_stdout(stream, max_line_bytes, *args, **kwargs):
+        # The byte cap identifies the stream: stdout gets max_output_bytes, stderr its own
+        # fixed _STDERR_RESERVE. Discriminating on the file object is not reliable.
+        if max_line_bytes == runtime.DEFAULT_MAX_OUTPUT_BYTES:
+            raise RuntimeError("pump exploded")
+        return real(stream, max_line_bytes, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.streamcap, "iter_bounded_lines", fail_on_stdout)
+    run = await runtime.run_async(
+        _py("import sys; print('lost'); sys.stderr.write('kept')"),
+        cwd=str(tmp_path),
+        timeout_seconds=10,
+    )
+    assert run.capture_failed
+    assert run.stdout == "", "the stdout pump died, so its capture is gone"
+    # Only the stdout pump was broken: proof the failure is attributed, not blanket.
+    assert run.stderr == "kept"
+    assert not run.timed_out, "a pump bug is not a timeout"
+    assert not run.binary_missing
+
+
+async def test_capture_failed_is_false_for_an_ordinary_run(tmp_path):
+    run = await runtime.run_async(_py("print('ok')"), cwd=str(tmp_path), timeout_seconds=10)
+    assert not run.capture_failed
+    assert run.stdout == "ok\n"
+
+
+def test_capture_failed_defaults_to_false_so_existing_constructions_keep_working():
+    """A defaulted field: every caller that builds a CommandRun positionally is unchanged."""
+    assert not runtime.CommandRun("out", "err", 0, 1, False).capture_failed
+    assert not runtime.run_sync_capture(_py("print('ok')"), timeout_seconds=10).capture_failed

@@ -25,11 +25,25 @@ This file is decision history, not current policy. Rules that still bind live in
   **every process on the machine**, and documents that it "must never raise into the
   caller's error path", but any unrelated program started with a non-UTF-8 `argv` made it
   raise — breaking teardown for every run, not only the one that owned the stray process.
-  It decodes with replacement now too.
+  It decodes with replacement now too. Whether the raw byte reaches it depends on the
+  platform's `ps`: it was observed passing through on macOS and not surfacing on the CI
+  Linux runners, so the exposure varies while the fix is unconditional.
 
   **Bridges:** output that previously arrived empty (or as a raised error from a probe)
   now arrives with U+FFFD in place of undecodable bytes. A bridge asserting on exact
   stdout may see text where it saw `""`.
+
+### Added
+
+- `CommandRun.capture_failed` (#18): a defaulted field set when a capture thread died, so
+  an empty stdout is distinguishable from output that was lost. `errors="replace"` removes
+  the one known cause, but not the shape it produced — a daemon pump thread's exception is
+  printed by `threading.excepthook` and then discarded, so *any* future failure in a pump
+  would again surface as a clean `exit_code=0` with empty output. The pumps now record it
+  and log at ERROR. Distinct from `output_truncated`, which means the byte cap was reached
+  and the capture is deliberately bounded. Defaulted, so every positional construction and
+  every caller that ignores it is unaffected; `run_sync_capture` has no pumps and always
+  reports `False`.
 
 - `runtime.run_sync_capture` now classifies every spawn failure as `binary_missing`
   instead of raising (#16). It caught only `FileNotFoundError` and `NotADirectoryError`,
