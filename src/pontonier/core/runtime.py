@@ -142,6 +142,11 @@ def _ps_matches(marker: str) -> list[tuple[int, int]]:
             ["ps", "-axww", "-o", "pid=,pgid=,command="],
             capture_output=True,
             text=True,
+            # ps reports every process on the machine, so an unrelated program started
+            # with a non-UTF-8 argv would otherwise raise UnicodeDecodeError here and
+            # break teardown for every run, not just its own.
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -415,6 +420,14 @@ async def run_async(
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            # Replacement, not strict: one stray byte from a CLI must not cost the whole
+            # capture. Strict decoding made run_sync_capture raise UnicodeDecodeError and
+            # killed run_async's pump thread, which returned exit 0 with empty output and
+            # no field a caller could branch on. Captured output is diagnostic text, so a
+            # U+FFFD is the right loss. Not surrogateescape (gitproc/gitdiff's choice for
+            # byte-exact git paths): a lone surrogate raises again wherever this text is
+            # re-encoded, which for a bridge is the JSON response.
+            errors="replace",
             env=env,
             start_new_session=True,
         )
@@ -517,6 +530,14 @@ def run_sync_capture(
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            # Replacement, not strict: one stray byte from a CLI must not cost the whole
+            # capture. Strict decoding made run_sync_capture raise UnicodeDecodeError and
+            # killed run_async's pump thread, which returned exit 0 with empty output and
+            # no field a caller could branch on. Captured output is diagnostic text, so a
+            # U+FFFD is the right loss. Not surrogateescape (gitproc/gitdiff's choice for
+            # byte-exact git paths): a lone surrogate raises again wherever this text is
+            # re-encoded, which for a bridge is the JSON response.
+            errors="replace",
             env=env,
         )
     except OSError:

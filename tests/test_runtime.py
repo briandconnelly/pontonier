@@ -774,3 +774,101 @@ def test_run_sync_capture_kills_and_closes_when_the_drain_raises(monkeypatch):
     assert elapsed < 10, f"propagating the drain error blocked for {elapsed:.1f}s"
     assert proc.returncode is not None, "child left running after the drain failed"
     assert _pipes_closed(proc), "pipes leaked after the drain failed"
+
+
+# --- Undecodable child output (#18) -----------------------------------------------------
+# Both runners decoded child output as strict UTF-8. One stray byte made run_sync_capture
+# raise UnicodeDecodeError and made run_async's pump thread die, returning a
+# success-shaped CommandRun with the output silently discarded.
+
+# `ok` before the bad byte and `tail` after it: pins that the decodable text on BOTH sides
+# survives, not merely that the call returned.
+_BAD_BYTE_CODE = r"import sys; sys.{stream}.buffer.write(b'ok\xff tail\n'); sys.{stream}.flush()"
+
+
+def test_run_sync_capture_replaces_undecodable_stdout():
+    run = runtime.run_sync_capture(_py(_BAD_BYTE_CODE.format(stream="stdout")), timeout_seconds=10)
+    assert run.exit_code == 0
+    assert run.stdout == "ok� tail\n"
+
+
+def test_run_sync_capture_replaces_undecodable_stderr():
+    run = runtime.run_sync_capture(_py(_BAD_BYTE_CODE.format(stream="stderr")), timeout_seconds=10)
+    assert run.exit_code == 0
+    assert run.stderr == "ok� tail\n"
+
+
+async def test_run_async_replaces_undecodable_stdout(tmp_path):
+    """The dangerous shape: not a raise, but exit 0 with the output silently dropped."""
+    run = await runtime.run_async(
+        _py(_BAD_BYTE_CODE.format(stream="stdout")), cwd=str(tmp_path), timeout_seconds=10
+    )
+    assert run.exit_code == 0
+    assert not run.timed_out
+    assert run.stdout == "ok� tail\n"
+
+
+async def test_run_async_replaces_undecodable_stderr(tmp_path):
+    run = await runtime.run_async(
+        _py(_BAD_BYTE_CODE.format(stream="stderr")), cwd=str(tmp_path), timeout_seconds=10
+    )
+    assert run.stderr == "ok� tail\n"
+
+
+async def test_both_runners_decode_undecodable_output_identically(tmp_path):
+    cmd = _py(_BAD_BYTE_CODE.format(stream="stdout"))
+    sync_run = runtime.run_sync_capture(cmd, timeout_seconds=10)
+    async_run = await runtime.run_async(cmd, cwd=str(tmp_path), timeout_seconds=10)
+    assert sync_run.stdout == async_run.stdout
+
+
+@pytest.mark.parametrize("runner", ["sync", "async"])
+async def test_a_multibyte_character_split_across_writes_is_not_corrupted(tmp_path, runner):
+    """The decoder must hold a partial sequence across a chunk boundary, not replace it.
+    'é' is written as its two UTF-8 bytes in separate flushed writes."""
+    code = (
+        "import sys, time; w = sys.stdout.buffer.write; "
+        "w(b'a\\xc3'); sys.stdout.flush(); time.sleep(0.2); "
+        "w(b'\\xa9b\\n'); sys.stdout.flush()"
+    )
+    if runner == "sync":
+        run = runtime.run_sync_capture(_py(code), timeout_seconds=10)
+    else:
+        run = await runtime.run_async(_py(code), cwd=str(tmp_path), timeout_seconds=10)
+    assert run.stdout == "aéb\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a bytes argv is POSIX-specific")
+def test_the_orphan_sweep_survives_an_undecodable_command_line():
+    """_ps_matches documents 'Returns [] on any failure — a sweep is best-effort cleanup
+    and must never raise into the caller's error path'. A process whose argv holds a
+    non-UTF-8 byte appears in `ps` output for every sweep on the machine, not only for
+    the run that owns it, so one such process broke teardown for every run."""
+    marker = "sweep-marker-undecodable"
+    # A bytes argv reaches execv unencoded; a str would be encoded to valid UTF-8 and the
+    # undecodable byte this test needs would never exist. `executable` is what puts the
+    # marker in argv[0] — passing it as args[0] alone would make it sleep's time argument,
+    # and sleep would reject it and exit before any sweep could see it.
+    proc = subprocess.Popen([marker.encode() + b"-\xff", b"5"], executable=b"/bin/sleep")
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not _raw_ps_contains(marker):
+            time.sleep(0.05)
+        assert _raw_ps_contains(marker), "the undecodable process never reached ps output"
+        assert runtime.find_orphans(marker)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _raw_ps_contains(marker: str) -> bool:
+    """Confirm the marker is in raw ps BYTES — the guard that keeps the test above honest.
+    Without it the test passes when the process failed to start and nothing was scanned.
+
+    Searches for the marker followed by the RAW undecodable byte, not the marker alone: a
+    test runner started from a shell that echoed this file has the marker in its own
+    command line, where the byte appears as the four characters ``\xff``. Matching the
+    marker alone therefore reports success from the harness's own argv while the child is
+    dead."""
+    raw = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, check=False).stdout
+    return marker.encode() + b"-\xff" in raw

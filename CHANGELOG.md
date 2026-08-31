@@ -10,6 +10,27 @@ This file is decision history, not current policy. Rules that still bind live in
 
 ### Fixed
 
+- Undecodable child output no longer breaks a run (#18). Both runners decoded a
+  subprocess's streams as strict UTF-8, so one stray byte from a CLI broke each of them
+  differently: `run_sync_capture` raised `UnicodeDecodeError`, and `run_async` did not
+  raise at all — its stdout pump thread died and the run returned a success-shaped
+  `CommandRun` (`exit_code=0`, `timed_out=False`, `output_truncated=False`) with the
+  output silently discarded, leaving a caller no field to branch on. Both now decode with
+  `errors="replace"`: captured output is diagnostic text, so a U+FFFD is the right loss.
+  Not `errors="surrogateescape"`, which `gitproc`/`gitdiff` use deliberately for
+  byte-exact git paths — a lone surrogate raises again wherever the text is re-encoded,
+  which for a bridge is the JSON response.
+
+  The same strictness broke the orphan sweep. `_ps_matches` reads the command line of
+  **every process on the machine**, and documents that it "must never raise into the
+  caller's error path", but any unrelated program started with a non-UTF-8 `argv` made it
+  raise — breaking teardown for every run, not only the one that owned the stray process.
+  It decodes with replacement now too.
+
+  **Bridges:** output that previously arrived empty (or as a raised error from a probe)
+  now arrives with U+FFFD in place of undecodable bytes. A bridge asserting on exact
+  stdout may see text where it saw `""`.
+
 - `runtime.run_sync_capture` now classifies every spawn failure as `binary_missing`
   instead of raising (#16). It caught only `FileNotFoundError` and `NotADirectoryError`,
   and wrapped the whole `subprocess.run` lifecycle in that one `try`, so a binary that is
