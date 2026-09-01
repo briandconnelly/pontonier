@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import signal
 import subprocess
@@ -12,7 +13,7 @@ import time
 import anyio
 import pytest
 
-from pontonier.core import runtime
+from pontonier.core import runtime, streamcap
 
 
 def _py(code: str) -> list[str]:
@@ -774,3 +775,244 @@ def test_run_sync_capture_kills_and_closes_when_the_drain_raises(monkeypatch):
     assert elapsed < 10, f"propagating the drain error blocked for {elapsed:.1f}s"
     assert proc.returncode is not None, "child left running after the drain failed"
     assert _pipes_closed(proc), "pipes leaked after the drain failed"
+
+
+# --- Undecodable child output (#18) -----------------------------------------------------
+# Both runners decoded child output as strict UTF-8. One stray byte made run_sync_capture
+# raise UnicodeDecodeError and made run_async's pump thread die, returning a
+# success-shaped CommandRun with the output silently discarded.
+
+# `ok` before the bad byte and `tail` after it: pins that the decodable text on BOTH sides
+# survives, not merely that the call returned.
+_BAD_BYTE_CODE = r"import sys; sys.{stream}.buffer.write(b'ok\xff tail\n'); sys.{stream}.flush()"
+
+
+def test_run_sync_capture_replaces_undecodable_stdout():
+    run = runtime.run_sync_capture(_py(_BAD_BYTE_CODE.format(stream="stdout")), timeout_seconds=10)
+    assert run.exit_code == 0
+    assert run.stdout == "ok� tail\n"
+
+
+def test_run_sync_capture_replaces_undecodable_stderr():
+    run = runtime.run_sync_capture(_py(_BAD_BYTE_CODE.format(stream="stderr")), timeout_seconds=10)
+    assert run.exit_code == 0
+    assert run.stderr == "ok� tail\n"
+
+
+async def test_run_async_replaces_undecodable_stdout(tmp_path):
+    """The dangerous shape: not a raise, but exit 0 with the output silently dropped."""
+    run = await runtime.run_async(
+        _py(_BAD_BYTE_CODE.format(stream="stdout")), cwd=str(tmp_path), timeout_seconds=10
+    )
+    assert run.exit_code == 0
+    assert not run.timed_out
+    assert run.stdout == "ok� tail\n"
+
+
+async def test_run_async_replaces_undecodable_stderr(tmp_path):
+    run = await runtime.run_async(
+        _py(_BAD_BYTE_CODE.format(stream="stderr")), cwd=str(tmp_path), timeout_seconds=10
+    )
+    assert run.stderr == "ok� tail\n"
+
+
+async def test_both_runners_decode_undecodable_output_identically(tmp_path):
+    cmd = _py(_BAD_BYTE_CODE.format(stream="stdout"))
+    sync_run = runtime.run_sync_capture(cmd, timeout_seconds=10)
+    async_run = await runtime.run_async(cmd, cwd=str(tmp_path), timeout_seconds=10)
+    assert sync_run.stdout == async_run.stdout
+
+
+class _SplitStream(io.RawIOBase):
+    """A raw stream that hands out exactly the chunks given, one per read.
+
+    The point is determinism: a child that flushes twice does NOT guarantee the reader
+    sees two chunks — if the pump is not scheduled between the writes, both bytes are
+    already buffered and get decoded together, so a decoder that mishandled a split
+    sequence would still pass. This forces the split.
+    """
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        if not self._chunks:
+            return 0
+        chunk = self._chunks.pop(0)
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
+
+def test_a_multibyte_character_split_across_reads_is_not_corrupted():
+    """The decoding the runners configure must hold a partial sequence across a read
+    boundary rather than replacing it. Built exactly as Popen builds it — utf-8 with
+    errors='replace' — over a stream whose two reads split 'é' down the middle."""
+    stream = io.TextIOWrapper(
+        io.BufferedReader(_SplitStream([b"a\xc3", b"\xa9b\n"]), buffer_size=2),
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert list(streamcap.iter_bounded_lines(stream, 1024)) == ["aéb\n"]
+
+
+@pytest.mark.parametrize("runner", ["sync", "async"])
+async def test_a_multibyte_character_split_across_writes_survives_a_real_run(tmp_path, runner):
+    """End-to-end companion to the deterministic test above. This one cannot guarantee the
+    reader sees two chunks, so it is a smoke test of the whole path, not the boundary
+    proof — the split is pinned by test_a_multibyte_character_split_across_reads_*."""
+    code = (
+        "import sys, time; w = sys.stdout.buffer.write; "
+        "w(b'a\\xc3'); sys.stdout.flush(); time.sleep(0.2); "
+        "w(b'\\xa9b\\n'); sys.stdout.flush()"
+    )
+    if runner == "sync":
+        run = runtime.run_sync_capture(_py(code), timeout_seconds=10)
+    else:
+        run = await runtime.run_async(_py(code), cwd=str(tmp_path), timeout_seconds=10)
+    assert run.stdout == "aéb\n"
+
+
+def _fake_ps(tmp_path, line_bytes: bytes) -> str:
+    """A PATH entry whose `ps` emits exactly `line_bytes`.
+
+    `_ps_matches` invokes `ps` by bare name, so a fake one ahead of it on PATH exercises
+    the real decode path deterministically. The alternative — a real process with an
+    undecodable argv — depends on whether the platform's own `ps` passes the raw byte
+    through, which macOS does and the CI Linux runners do not.
+    """
+    entry = tmp_path / "fakebin"
+    entry.mkdir()
+    script = entry / "ps"
+    script.write_bytes(
+        b"#!" + sys.executable.encode() + b"\n"
+        b"import sys\n"
+        b"sys.stdout.buffer.write(" + repr(line_bytes).encode() + b")\n"
+    )
+    script.chmod(0o755)
+    return str(entry)
+
+
+def test_the_orphan_sweep_survives_an_undecodable_command_line(tmp_path, monkeypatch):
+    """_ps_matches documents 'Returns [] on any failure — a sweep is best-effort cleanup
+    and must never raise into the caller's error path'. It reads the command line of every
+    process on the machine, so one unrelated program started with a non-UTF-8 argv made it
+    raise — breaking teardown for every run, not only the one that owned that process."""
+    marker = "sweep-marker-undecodable"
+    line = b"4242 4242 " + marker.encode() + b"-\xff --flag\n"
+    monkeypatch.setenv("PATH", _fake_ps(tmp_path, line) + os.pathsep + os.environ["PATH"])
+    assert runtime.find_orphans(marker) == [4242]
+
+
+def test_the_orphan_sweep_still_finds_ordinary_processes_through_the_fake_ps(tmp_path, monkeypatch):
+    """Instrument check for the test above: the fake `ps` is actually consulted, and a
+    clean line is matched. Without this, a fake that emitted nothing usable would make the
+    undecodable case look handled when it was simply never scanned."""
+    marker = "sweep-marker-plain"
+    monkeypatch.setenv(
+        "PATH",
+        _fake_ps(tmp_path, b"4243 4243 " + marker.encode() + b" --flag\n")
+        + os.pathsep
+        + os.environ["PATH"],
+    )
+    assert runtime.find_orphans(marker) == [4243]
+
+
+def test_the_sweep_does_not_match_a_marker_against_a_different_byte_sequence(tmp_path, monkeypatch):
+    """The sweep SIGKILLs whole process groups, so a false match kills unrelated work.
+
+    Decoding ps output with replacement collapses every invalid byte to U+FFFD, which
+    makes distinct command lines compare equal: a marker holding a literal U+FFFD would
+    match an unrelated process whose argv holds a raw 0xff. That is newly reachable —
+    this same change makes both runners return U+FFFD, so a bridge deriving a marker from
+    CLI output can legitimately hold one. Process identity needs byte fidelity, unlike
+    captured output, and nothing but pids leaves this function."""
+    marker = "/tmp/job-\ufffd-workspace"
+    line = b"4242 4242 /tmp/job-\xff-workspace --flag\n"
+    monkeypatch.setenv("PATH", _fake_ps(tmp_path, line) + os.pathsep + os.environ["PATH"])
+    assert runtime.find_orphans(marker) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a bytes argv is POSIX-specific")
+def test_a_real_process_with_an_undecodable_argv_does_not_break_the_sweep():
+    """The same contract against the platform's real `ps`, for the platforms that pass an
+    undecodable byte through. Skipped where `ps` sanitizes it, because the condition under
+    test cannot occur there — never asserted away as a pass."""
+    marker = "sweep-marker-real-undecodable"
+    # `executable` is what puts the marker in argv[0]; as args[0] alone it would be sleep's
+    # time argument, and sleep would reject it and exit before any sweep could see it.
+    proc = subprocess.Popen([marker.encode() + b"-\xff", b"5"], executable=b"/bin/sleep")
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not _raw_ps_contains(marker.encode()):
+            time.sleep(0.05)
+        if not _raw_ps_contains(marker.encode()):
+            pytest.fail("the process never reached ps output at all")
+        if not _raw_ps_contains(marker.encode() + b"-\xff"):
+            pytest.skip("this platform's ps does not surface the raw undecodable byte")
+        # Membership, not equality: a shell that echoed this file carries the marker in
+        # its own command line and legitimately matches too.
+        assert proc.pid in runtime.find_orphans(marker)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _raw_ps_contains(needle: bytes) -> bool:
+    """Whether `needle` appears in raw ps BYTES.
+
+    Callers pass the marker plus the RAW undecodable byte when they mean to detect the
+    child: a test runner started from a shell that echoed this file carries the marker in
+    its own command line, where the byte appears as the four characters ``\xff``, so
+    matching the marker alone reports success from the harness's own argv.
+    """
+    raw = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, check=False).stdout
+    return needle in raw
+
+
+# --- Pump-thread failure is visible (#18) -----------------------------------------------
+# errors="replace" removed the one known way a pump thread could die, but not the shape it
+# produced: any exception in a pump left a success-shaped CommandRun with the output gone.
+
+
+async def test_a_dead_stdout_pump_is_reported_rather_than_read_as_empty_output(
+    tmp_path, monkeypatch
+):
+    """The gap errors="replace" does not close: a pump can still die for another reason,
+    and 'the command produced no output' must stay distinguishable from 'the output was
+    lost'. Simulated at the capture boundary because every real cause is now fixed."""
+    real = runtime.streamcap.iter_bounded_lines
+
+    def fail_on_stdout(stream, max_line_bytes, *args, **kwargs):
+        # The byte cap identifies the stream: stdout gets max_output_bytes, stderr its own
+        # fixed _STDERR_RESERVE. Discriminating on the file object is not reliable.
+        if max_line_bytes == runtime.DEFAULT_MAX_OUTPUT_BYTES:
+            raise RuntimeError("pump exploded")
+        return real(stream, max_line_bytes, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.streamcap, "iter_bounded_lines", fail_on_stdout)
+    run = await runtime.run_async(
+        _py("import sys; print('lost'); sys.stderr.write('kept')"),
+        cwd=str(tmp_path),
+        timeout_seconds=10,
+    )
+    assert run.capture_failed
+    assert run.stdout == "", "the stdout pump died, so its capture is gone"
+    # Only the stdout pump was broken: proof the failure is attributed, not blanket.
+    assert run.stderr == "kept"
+    assert not run.timed_out, "a pump bug is not a timeout"
+    assert not run.binary_missing
+
+
+async def test_capture_failed_is_false_for_an_ordinary_run(tmp_path):
+    run = await runtime.run_async(_py("print('ok')"), cwd=str(tmp_path), timeout_seconds=10)
+    assert not run.capture_failed
+    assert run.stdout == "ok\n"
+
+
+def test_capture_failed_defaults_to_false_so_existing_constructions_keep_working():
+    """A defaulted field: every caller that builds a CommandRun positionally is unchanged."""
+    assert not runtime.CommandRun("out", "err", 0, 1, False).capture_failed
+    assert not runtime.run_sync_capture(_py("print('ok')"), timeout_seconds=10).capture_failed

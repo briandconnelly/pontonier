@@ -61,6 +61,11 @@ class CommandRun:
     elapsed_ms: int
     timed_out: bool
     output_truncated: bool = field(default=False)
+    # Set when a capture thread died, so an empty stdout is distinguishable from output
+    # that was lost. Distinct from output_truncated, which means the byte cap was hit and
+    # the capture is deliberately bounded. Defaulted: every positional construction and
+    # every caller that ignores it is unaffected.
+    capture_failed: bool = field(default=False)
 
     @property
     def binary_missing(self) -> bool:
@@ -142,6 +147,20 @@ def _ps_matches(marker: str) -> list[tuple[int, int]]:
             ["ps", "-axww", "-o", "pid=,pgid=,command="],
             capture_output=True,
             text=True,
+            # ps reports every process on the machine, so an unrelated program started
+            # with a non-UTF-8 argv would otherwise raise UnicodeDecodeError here and
+            # break teardown for every run, not just its own.
+            #
+            # surrogateescape, NOT the replace used for captured output: this text decides
+            # which process groups get SIGKILLed, so it needs byte identity. Replacement
+            # collapses every invalid byte to U+FFFD, making distinct command lines compare
+            # equal — a marker holding a literal U+FFFD would match an unrelated process
+            # whose argv holds a raw 0xff, and the sweep would kill its group. That is
+            # newly reachable, because this same change makes both runners return U+FFFD.
+            # Safe here and not for captured output: nothing but pids leaves this function,
+            # so a lone surrogate can never reach a caller's JSON response.
+            encoding="utf-8",
+            errors="surrogateescape",
             timeout=10,
             check=False,
         )
@@ -242,12 +261,14 @@ def _wait_streaming(  # noqa: PLR0915
     timeout_seconds: int,
     max_output_bytes: int,
     orphan_marker: str | None = None,
-) -> tuple[str, str, bool, bool]:
+) -> tuple[str, str, bool, bool, bool]:
     """Drain stdout/stderr concurrently under independent byte caps, optionally
     calling ``on_stdout_line`` per stdout line. Returns ``(stdout, stderr,
-    timed_out, output_truncated)``. Stdout is captured up to ``max_output_bytes``
-    bytes; stderr is captured up to a separate ``_STDERR_RESERVE`` (~1 MiB) —
-    worst-case retained is ``max_output_bytes + _STDERR_RESERVE``. Both use
+    timed_out, output_truncated, capture_failed)``, the last set when a capture
+    thread died and its stream's output was therefore lost. Stdout is captured up
+    to ``max_output_bytes`` bytes; stderr is captured up to a separate
+    ``_STDERR_RESERVE`` (~1 MiB) — worst-case retained is
+    ``max_output_bytes + _STDERR_RESERVE``. Both use
     head+tail windows so a flooding process cannot exhaust memory. The timeout
     is deadline-based: the main thread waits for the direct child and joins the
     pump threads within the remaining budget; if the deadline is exceeded, the
@@ -271,6 +292,10 @@ def _wait_streaming(  # noqa: PLR0915
     _queued_bytes: list[int] = [0]
     _qb_lock = threading.Lock()
 
+    # A daemon thread's exception is printed by threading.excepthook and then discarded,
+    # so before this the run reported exit 0 with the output silently missing.
+    capture_failures: list[BaseException] = []
+
     def _pump_stdout() -> None:
         try:
             if proc.stdout is not None:
@@ -287,6 +312,9 @@ def _wait_streaming(  # noqa: PLR0915
                                     _queued_bytes[0] += n
                                 except queue.Full:
                                     pass  # count guard: drop silently
+        except BaseException as exc:  # recorded, then reported on the result
+            capture_failures.append(exc)
+            logger.error("stdout capture failed: %s", exc, exc_info=True)
         finally:
             if observe:
                 _pump_done.set()  # non-blocking: pump never waits on the observer
@@ -313,9 +341,13 @@ def _wait_streaming(  # noqa: PLR0915
                     _callback(item)
 
     def _pump_stderr() -> None:
-        if proc.stderr is not None:
-            for line in streamcap.iter_bounded_lines(cast("TextIO", proc.stderr), stderr_cap):
-                err.add(line)
+        try:
+            if proc.stderr is not None:
+                for line in streamcap.iter_bounded_lines(cast("TextIO", proc.stderr), stderr_cap):
+                    err.add(line)
+        except BaseException as exc:  # recorded, then reported on the result
+            capture_failures.append(exc)
+            logger.error("stderr capture failed: %s", exc, exc_info=True)
 
     def _write_stdin() -> None:
         if proc.stdin is None:
@@ -386,7 +418,7 @@ def _wait_streaming(  # noqa: PLR0915
             proc.pid,
             max_output_bytes,
         )
-    return out.result(), err.result(), timed_out, truncated
+    return out.result(), err.result(), timed_out, truncated, bool(capture_failures)
 
 
 async def run_async(
@@ -415,6 +447,14 @@ async def run_async(
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            # Replacement, not strict: one stray byte from a CLI must not cost the whole
+            # capture. Strict decoding made run_sync_capture raise UnicodeDecodeError and
+            # killed run_async's pump thread, which returned exit 0 with empty output and
+            # no field a caller could branch on. Captured output is diagnostic text, so a
+            # U+FFFD is the right loss. Not surrogateescape (gitproc/gitdiff's choice for
+            # byte-exact git paths): a lone surrogate raises again wherever this text is
+            # re-encoded, which for a bridge is the JSON response.
+            errors="replace",
             env=env,
             start_new_session=True,
         )
@@ -425,7 +465,7 @@ async def run_async(
 
     logger.debug("spawned pid=%s cmd=%s timeout=%ss", proc.pid, cmd[0], timeout_seconds)
 
-    def _wait() -> tuple[str, str, bool, bool]:
+    def _wait() -> tuple[str, str, bool, bool, bool]:
         return _wait_streaming(
             proc,
             stdin_text,
@@ -436,7 +476,9 @@ async def run_async(
         )
 
     try:
-        out, err, timed_out, truncated = await run_sync(_wait, abandon_on_cancel=True)
+        out, err, timed_out, truncated, capture_failed = await run_sync(
+            _wait, abandon_on_cancel=True
+        )
     except anyio.get_cancelled_exc_class():
         logger.warning("subprocess pid=%s cancelled; killing process group", proc.pid)
         # _kill_group does NOT early-return when the direct child has already exited
@@ -471,7 +513,15 @@ async def run_async(
                 )
     elapsed = int((time.monotonic() - start) * 1000)
     if timed_out:
-        return CommandRun(out, TIMED_OUT, -9, elapsed, True, output_truncated=truncated)
+        return CommandRun(
+            out,
+            TIMED_OUT,
+            -9,
+            elapsed,
+            True,
+            output_truncated=truncated,
+            capture_failed=capture_failed,
+        )
     logger.debug(
         "subprocess pid=%s exited code=%s elapsed_ms=%s stdout_bytes=%s",
         proc.pid,
@@ -479,7 +529,15 @@ async def run_async(
         elapsed,
         len(out or ""),
     )
-    return CommandRun(out, err, proc.returncode, elapsed, False, output_truncated=truncated)
+    return CommandRun(
+        out,
+        err,
+        proc.returncode,
+        elapsed,
+        False,
+        output_truncated=truncated,
+        capture_failed=capture_failed,
+    )
 
 
 def run_sync_capture(
@@ -517,6 +575,14 @@ def run_sync_capture(
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            # Replacement, not strict: one stray byte from a CLI must not cost the whole
+            # capture. Strict decoding made run_sync_capture raise UnicodeDecodeError and
+            # killed run_async's pump thread, which returned exit 0 with empty output and
+            # no field a caller could branch on. Captured output is diagnostic text, so a
+            # U+FFFD is the right loss. Not surrogateescape (gitproc/gitdiff's choice for
+            # byte-exact git paths): a lone surrogate raises again wherever this text is
+            # re-encoded, which for a bridge is the JSON response.
+            errors="replace",
             env=env,
         )
     except OSError:
