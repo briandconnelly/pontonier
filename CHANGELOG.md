@@ -6,9 +6,44 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This file is decision history, not current policy. Rules that still bind live in
 [AGENTS.md](AGENTS.md) and the documents it links.
 
-## [Unreleased]
+## [0.8.0] — 2026-08-31
+
+### Added
+
+- `CommandRun.capture_failed` (#18): a defaulted field set when a capture thread died, so
+  an empty stdout is distinguishable from output that was lost. `errors="replace"` removes
+  the one known cause, but not the shape it produced — a daemon pump thread's exception is
+  printed by `threading.excepthook` and then discarded, so *any* future failure in a pump
+  would again surface as a clean `exit_code=0` with empty output. The pumps now record it
+  and log at ERROR. Distinct from `output_truncated`, which means the byte cap was reached
+  and the capture is deliberately bounded. Defaulted, so every positional construction and
+  every caller that ignores it is unaffected; `run_sync_capture` has no pumps and always
+  reports `False`.
 
 ### Fixed
+
+- `runtime.run_sync_capture` now classifies every spawn failure as `binary_missing`
+  instead of raising (#16). It caught only `FileNotFoundError` and `NotADirectoryError`,
+  and wrapped the whole `subprocess.run` lifecycle in that one `try`, so a binary that is
+  present but cannot be executed — a directory with the binary's name on `PATH`, a file
+  without the execute bit, an ENOEXEC file — escaped as a raised `OSError` from a function
+  whose docstring promises a `CommandRun` and the same shape as `run_async`. `run_async`
+  already caught `OSError` around `Popen` alone and classified all of them. The in-repo
+  caller broke on the same edge: `preflight.HelpProbe.flag_support` promises to fail open
+  and instead propagated the `PermissionError`.
+
+  The fix isolates the spawn from the drain, rather than widening the existing `except`:
+  the single `try` covered both phases, so nothing inside or outside the function could
+  tell a failed exec from a failed pipe read, and a widened clause would have reported a
+  communicate failure as a missing binary. A communicate-phase error still propagates,
+  after the child is killed and its pipes are closed — dropping `subprocess.run` means
+  reproducing the cleanup its `with Popen(...)` performed on every exit path.
+
+  **Bridges:** `BINARY_NOT_FOUND` marks the whole spawn phase, not only an absent binary —
+  it already covered an unusable `cwd` before this change. A bridge that turns
+  `binary_missing` into "install the CLI" advice may want to widen that wording.
+  `codex-in-claude` can drop the downstream `errno`+`OSError.filename` heuristic it carries
+  for this (codex-in-claude#541) once it pins a release containing this fix.
 
 - Undecodable child output no longer breaks a run (#18). Both runners decoded a
   subprocess's streams as strict UTF-8, so one stray byte from a CLI broke each of them
@@ -39,41 +74,6 @@ This file is decision history, not current policy. Rules that still bind live in
   **Bridges:** output that previously arrived empty (or as a raised error from a probe)
   now arrives with U+FFFD in place of undecodable bytes. A bridge asserting on exact
   stdout may see text where it saw `""`.
-
-### Added
-
-- `CommandRun.capture_failed` (#18): a defaulted field set when a capture thread died, so
-  an empty stdout is distinguishable from output that was lost. `errors="replace"` removes
-  the one known cause, but not the shape it produced — a daemon pump thread's exception is
-  printed by `threading.excepthook` and then discarded, so *any* future failure in a pump
-  would again surface as a clean `exit_code=0` with empty output. The pumps now record it
-  and log at ERROR. Distinct from `output_truncated`, which means the byte cap was reached
-  and the capture is deliberately bounded. Defaulted, so every positional construction and
-  every caller that ignores it is unaffected; `run_sync_capture` has no pumps and always
-  reports `False`.
-
-- `runtime.run_sync_capture` now classifies every spawn failure as `binary_missing`
-  instead of raising (#16). It caught only `FileNotFoundError` and `NotADirectoryError`,
-  and wrapped the whole `subprocess.run` lifecycle in that one `try`, so a binary that is
-  present but cannot be executed — a directory with the binary's name on `PATH`, a file
-  without the execute bit, an ENOEXEC file — escaped as a raised `OSError` from a function
-  whose docstring promises a `CommandRun` and the same shape as `run_async`. `run_async`
-  already caught `OSError` around `Popen` alone and classified all of them. The in-repo
-  caller broke on the same edge: `preflight.HelpProbe.flag_support` promises to fail open
-  and instead propagated the `PermissionError`.
-
-  The fix isolates the spawn from the drain, rather than widening the existing `except`:
-  the single `try` covered both phases, so nothing inside or outside the function could
-  tell a failed exec from a failed pipe read, and a widened clause would have reported a
-  communicate failure as a missing binary. A communicate-phase error still propagates,
-  after the child is killed and its pipes are closed — dropping `subprocess.run` means
-  reproducing the cleanup its `with Popen(...)` performed on every exit path.
-
-  **Bridges:** `BINARY_NOT_FOUND` marks the whole spawn phase, not only an absent binary —
-  it already covered an unusable `cwd` before this change. A bridge that turns
-  `binary_missing` into "install the CLI" advice may want to widen that wording.
-  `codex-in-claude` can drop the downstream `errno`+`OSError.filename` heuristic it carries
-  for this (codex-in-claude#541) once it pins a release containing this fix.
 
 ## [0.7.0] — 2026-08-30
 
