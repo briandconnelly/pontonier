@@ -25,9 +25,16 @@ This file is decision history, not current policy. Rules that still bind live in
   **every process on the machine**, and documents that it "must never raise into the
   caller's error path", but any unrelated program started with a non-UTF-8 `argv` made it
   raise — breaking teardown for every run, not only the one that owned the stray process.
-  It decodes with replacement now too. Whether the raw byte reaches it depends on the
-  platform's `ps`: it was observed passing through on macOS and not surfacing on the CI
-  Linux runners, so the exposure varies while the fix is unconditional.
+  It decodes with `errors="surrogateescape"` — deliberately not the replacement used for
+  captured output. That text decides which process groups get `SIGKILL`ed, so it needs
+  byte identity: replacement collapses every invalid byte to U+FFFD, which makes distinct
+  command lines compare equal, and a marker holding a literal U+FFFD would match an
+  unrelated process whose `argv` holds a raw `0xff`. This change makes that newly
+  reachable, because it is what starts putting U+FFFD in the output a bridge may derive a
+  marker from. A lone surrogate cannot leak: nothing but pids leaves that function.
+  Whether the raw byte reaches it at all depends on the platform's `ps` — observed passing
+  through on macOS and not surfacing on the CI Linux runners — so the exposure varies
+  while the fix is unconditional.
 
   **Bridges:** output that previously arrived empty (or as a raised error from a probe)
   now arrives with U+FFFD in place of undecodable bytes. A bridge asserting on exact

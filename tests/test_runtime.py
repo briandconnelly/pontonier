@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import signal
 import subprocess
@@ -12,7 +13,7 @@ import time
 import anyio
 import pytest
 
-from pontonier.core import runtime
+from pontonier.core import runtime, streamcap
 
 
 def _py(code: str) -> list[str]:
@@ -822,10 +823,46 @@ async def test_both_runners_decode_undecodable_output_identically(tmp_path):
     assert sync_run.stdout == async_run.stdout
 
 
+class _SplitStream(io.RawIOBase):
+    """A raw stream that hands out exactly the chunks given, one per read.
+
+    The point is determinism: a child that flushes twice does NOT guarantee the reader
+    sees two chunks — if the pump is not scheduled between the writes, both bytes are
+    already buffered and get decoded together, so a decoder that mishandled a split
+    sequence would still pass. This forces the split.
+    """
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        if not self._chunks:
+            return 0
+        chunk = self._chunks.pop(0)
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
+
+def test_a_multibyte_character_split_across_reads_is_not_corrupted():
+    """The decoding the runners configure must hold a partial sequence across a read
+    boundary rather than replacing it. Built exactly as Popen builds it — utf-8 with
+    errors='replace' — over a stream whose two reads split 'é' down the middle."""
+    stream = io.TextIOWrapper(
+        io.BufferedReader(_SplitStream([b"a\xc3", b"\xa9b\n"]), buffer_size=2),
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert list(streamcap.iter_bounded_lines(stream, 1024)) == ["aéb\n"]
+
+
 @pytest.mark.parametrize("runner", ["sync", "async"])
-async def test_a_multibyte_character_split_across_writes_is_not_corrupted(tmp_path, runner):
-    """The decoder must hold a partial sequence across a chunk boundary, not replace it.
-    'é' is written as its two UTF-8 bytes in separate flushed writes."""
+async def test_a_multibyte_character_split_across_writes_survives_a_real_run(tmp_path, runner):
+    """End-to-end companion to the deterministic test above. This one cannot guarantee the
+    reader sees two chunks, so it is a smoke test of the whole path, not the boundary
+    proof — the split is pinned by test_a_multibyte_character_split_across_reads_*."""
     code = (
         "import sys, time; w = sys.stdout.buffer.write; "
         "w(b'a\\xc3'); sys.stdout.flush(); time.sleep(0.2); "
@@ -881,6 +918,21 @@ def test_the_orphan_sweep_still_finds_ordinary_processes_through_the_fake_ps(tmp
         + os.environ["PATH"],
     )
     assert runtime.find_orphans(marker) == [4243]
+
+
+def test_the_sweep_does_not_match_a_marker_against_a_different_byte_sequence(tmp_path, monkeypatch):
+    """The sweep SIGKILLs whole process groups, so a false match kills unrelated work.
+
+    Decoding ps output with replacement collapses every invalid byte to U+FFFD, which
+    makes distinct command lines compare equal: a marker holding a literal U+FFFD would
+    match an unrelated process whose argv holds a raw 0xff. That is newly reachable —
+    this same change makes both runners return U+FFFD, so a bridge deriving a marker from
+    CLI output can legitimately hold one. Process identity needs byte fidelity, unlike
+    captured output, and nothing but pids leaves this function."""
+    marker = "/tmp/job-\ufffd-workspace"
+    line = b"4242 4242 /tmp/job-\xff-workspace --flag\n"
+    monkeypatch.setenv("PATH", _fake_ps(tmp_path, line) + os.pathsep + os.environ["PATH"])
+    assert runtime.find_orphans(marker) == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="a bytes argv is POSIX-specific")

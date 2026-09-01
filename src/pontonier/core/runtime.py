@@ -150,8 +150,17 @@ def _ps_matches(marker: str) -> list[tuple[int, int]]:
             # ps reports every process on the machine, so an unrelated program started
             # with a non-UTF-8 argv would otherwise raise UnicodeDecodeError here and
             # break teardown for every run, not just its own.
+            #
+            # surrogateescape, NOT the replace used for captured output: this text decides
+            # which process groups get SIGKILLed, so it needs byte identity. Replacement
+            # collapses every invalid byte to U+FFFD, making distinct command lines compare
+            # equal — a marker holding a literal U+FFFD would match an unrelated process
+            # whose argv holds a raw 0xff, and the sweep would kill its group. That is
+            # newly reachable, because this same change makes both runners return U+FFFD.
+            # Safe here and not for captured output: nothing but pids leaves this function,
+            # so a lone surrogate can never reach a caller's JSON response.
             encoding="utf-8",
-            errors="replace",
+            errors="surrogateescape",
             timeout=10,
             check=False,
         )
@@ -255,9 +264,11 @@ def _wait_streaming(  # noqa: PLR0915
 ) -> tuple[str, str, bool, bool, bool]:
     """Drain stdout/stderr concurrently under independent byte caps, optionally
     calling ``on_stdout_line`` per stdout line. Returns ``(stdout, stderr,
-    timed_out, output_truncated)``. Stdout is captured up to ``max_output_bytes``
-    bytes; stderr is captured up to a separate ``_STDERR_RESERVE`` (~1 MiB) —
-    worst-case retained is ``max_output_bytes + _STDERR_RESERVE``. Both use
+    timed_out, output_truncated, capture_failed)``, the last set when a capture
+    thread died and its stream's output was therefore lost. Stdout is captured up
+    to ``max_output_bytes`` bytes; stderr is captured up to a separate
+    ``_STDERR_RESERVE`` (~1 MiB) — worst-case retained is
+    ``max_output_bytes + _STDERR_RESERVE``. Both use
     head+tail windows so a flooding process cannot exhaust memory. The timeout
     is deadline-based: the main thread waits for the direct child and joins the
     pump threads within the remaining budget; if the deadline is exceeded, the
