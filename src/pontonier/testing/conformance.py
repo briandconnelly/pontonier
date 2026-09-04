@@ -85,19 +85,34 @@ def check_backend(contract: BackendContract, backend: object) -> list[str]:
         # stdout is empty or not JSON. One that raises there turns a classifiable
         # run into a consumer crash, so tolerance is the invariant, not accuracy.
         probe = RunRequest(kind="consult", prompt="conformance probe", cwd=".", timeout_seconds=1)
-        for stdout in ("", "not json", "{"):
-            outcome = RunOutcome(run=CommandRun(stdout, "", 0, 1, False))
+        # Each outcome carries nothing but the process result — no events, no
+        # artifact_texts — because that is what a consumer has when the process
+        # never produced them. Returning a ClassifiedFailure for these is fine;
+        # raising is the violation.
+        hostile = (
+            RunOutcome(run=CommandRun("", "", 0, 1, False)),
+            RunOutcome(run=CommandRun("not json", "", 0, 1, False)),
+            RunOutcome(run=CommandRun("{", "", 0, 1, False)),
+            RunOutcome(run=CommandRun("", "", 124, 1, True)),  # timed out is still "completed"
+        )
+        for outcome in hostile:
+            label = f"stdout {outcome.run.stdout!r}" + (
+                ", timed out" if outcome.run.timed_out else ""
+            )
             try:
                 result = backend.inspect_outcome(outcome, probe)
             except Exception as exc:
                 out.append(
-                    f"inspect_outcome raised {type(exc).__name__} on stdout {stdout!r}; "
+                    f"inspect_outcome raised {type(exc).__name__} on {label}; "
                     "it must return None or a ClassifiedFailure"
                 )
                 continue
+            # Reachable only when a plugin violates its own annotation; a type
+            # checker may call this branch unreachable. Keep it — third-party
+            # plugins are exactly who this probe exists for.
             if result is not None and not isinstance(result, ClassifiedFailure):
                 out.append(
-                    f"inspect_outcome returned {type(result).__name__} on stdout "
-                    f"{stdout!r}; it must return None or a ClassifiedFailure"
+                    f"inspect_outcome returned {type(result).__name__} on {label}; "
+                    "it must return None or a ClassifiedFailure"
                 )
     return out

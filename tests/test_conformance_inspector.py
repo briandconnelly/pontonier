@@ -37,6 +37,13 @@ class WrongTypeInspector(ClaudeLikeBackend):
         return "not a ClassifiedFailure"
 
 
+class AlwaysFailsInspector(ClaudeLikeBackend):
+    """The realistic shape: anything that is not a clean envelope is a failure."""
+
+    def inspect_outcome(self, outcome: RunOutcome, request: RunRequest) -> ClassifiedFailure | None:
+        return ClassifiedFailure(code="nonzero_exit", detail="not a clean envelope")
+
+
 def test_backend_without_the_capability_is_unaffected():
     assert conformance.check_backend(CLAUDE_CONTRACT, ClaudeLikeBackend()) == []
 
@@ -50,9 +57,18 @@ def test_raising_inspector_is_a_violation():
     assert violations, "the probe must catch an inspector that raises on non-JSON stdout"
     assert all(v.startswith("inspect_outcome raised") for v in violations)
     assert any("JSONDecodeError" in v for v in violations)
+    assert len(violations) == 4
+    assert any("timed out" in v for v in violations)
 
 
 def test_wrong_return_type_is_a_violation():
     violations = conformance.check_backend(CLAUDE_CONTRACT, WrongTypeInspector())
     assert violations
     assert all(v.startswith("inspect_outcome returned") for v in violations)
+    assert len(violations) == 4
+
+
+def test_inspector_that_returns_a_failure_for_everything_is_clean():
+    # Tolerance is the invariant, not accuracy: returning a ClassifiedFailure for
+    # empty, malformed and timed-out outcomes is exactly what the probe accepts.
+    assert conformance.check_backend(CLAUDE_CONTRACT, AlwaysFailsInspector()) == []
