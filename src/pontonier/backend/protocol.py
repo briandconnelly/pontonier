@@ -151,17 +151,41 @@ class ExecResult:
 
 
 @dataclass(frozen=True)
+class RepairHint:
+    """One corrective next action, in the shape the bridges' error envelopes already
+    use: ``next_step`` is a stable symbolic label, ``tool``/``arguments`` name the
+    single callable repair when one exists, ``alternative`` is optional prose for a
+    human or agent when the primary call does not fit. Pure data; a consumer
+    serializes it into its own envelope (0.9.0, #24)."""
+
+    next_step: str
+    tool: str | None = None
+    arguments: dict[str, Any] | None = None
+    alternative: str | None = None
+
+
+@dataclass(frozen=True)
 class ClassifiedFailure:
     """A failure mapped into the shared taxonomy (see conventions.envelope).
 
     ``code`` is a taxonomy code. ``detail`` is sanitized, redacted prose safe
     for the wire. ``retry_after_ms`` is set only for temporary failures that
     declared a delay.
+
+    ``retryable``, ``details`` and ``repair`` (0.9.0, #24) let a backend that
+    already computes them hand them to a generic consumer; ``None`` on any of
+    them means the backend expressed no opinion and the consumer applies its own
+    defaults — it is never a claim. The shared skeleton in ``classify`` leaves
+    all three ``None``. ``details`` is the envelope's field-detail object
+    (``{field, value, reason}``), redacted by the backend before it lands here.
     """
 
     code: str
     detail: str
     retry_after_ms: int | None = None
+    retryable: bool | None = None
+    details: dict[str, Any] | None = None
+    repair: RepairHint | None = None
 
 
 @runtime_checkable
