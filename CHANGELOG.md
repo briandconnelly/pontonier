@@ -13,18 +13,20 @@ This file is decision history, not current policy. Rules that still bind live in
 - `Usage.cached_input_tokens` and `Usage.cache_creation_input_tokens`: defaulted fields for
   the cache accounting every bridge already reports and every adapter's `finalize` dropped.
   **Bridges:** each adapter can now carry the figure; nothing changes until it does.
-- `ClassifiedFailure.retryable`, `.details` and `.repair` (with the new `RepairHint`
-  dataclass) — #24 (background: briandconnelly/claude-in-codex#145). Defaulted; `None`
-  means the backend expressed no opinion, never a
-  claim. The shared classifier leaves all three `None`.
+- `ClassifiedFailure.retryable`, `.details`, `.repair` (with the new `RepairHint`
+  dataclass) and `.usage` (so a failure surfaced from a zero-exit error envelope keeps
+  its cost) — #24 (background: briandconnelly/claude-in-codex#145). Defaulted; `None`
+  means the backend expressed no opinion, never a claim. The shared classifier leaves
+  all four `None`.
   **Bridges:** `claude-in-codex` can stop documenting its `classify_failure` as lossy.
 - `OutcomeInspector`, an optional runtime-checkable capability, and the
   `pontonier.backend.protocol.inspect_outcome` helper: a backend whose process can exit 0
   and still have failed implements it, and a consumer calls the helper on every completed
   process before `finalize`. `AgentBackend` is unchanged and `CONTRACT_API_VERSION`
   stays 1.
-- `testing.conformance.check_backend` probes an `OutcomeInspector` with empty, non-JSON and
-  truncated stdout and reports a raise or a wrong return type as a violation.
+- `testing.conformance.check_backend` probes an `OutcomeInspector` with empty, non-JSON,
+  truncated and timed-out outcomes and reports a raise or a wrong return type as a
+  violation.
 - `scripts/check_consumers.sh`: runs each consuming bridge's suite against this tree's
   built wheel, asserting the wheel is the version each suite imports. Manual for now; the
   release procedure runs it before a release PR.
