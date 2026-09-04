@@ -113,10 +113,23 @@ class RunOutcome:
 
 @dataclass(frozen=True)
 class Usage:
+    """Token and cost accounting as the backend reported it; every field is None
+    when the backend did not report that figure.
+
+    ``cached_input_tokens`` (0.9.0) is the prompt-token count served from the
+    provider's cache (Codex and Kimi ``cached_input_tokens``, Claude
+    ``cache_read_input_tokens``); ``cache_creation_input_tokens`` (0.9.0) is the
+    count written into the cache (Claude only). Both are defaulted: the freeze
+    permits an appended defaulted field, and every existing positional
+    ``Usage(input, output, total, cost)`` call keeps its meaning.
+    """
+
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
     cost_usd: float | None = None
+    cached_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
