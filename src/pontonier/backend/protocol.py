@@ -233,3 +233,36 @@ class AgentBackend(Protocol):
         scrubbing per config mode, or a pass-through for backends needing
         neither."""
         ...
+
+
+@runtime_checkable
+class OutcomeInspector(Protocol):
+    """OPTIONAL capability (0.9.0): a backend whose process can exit 0 and still
+    have failed — Claude's CLI reports errors inside a zero-exit JSON envelope —
+    implements this so a generic consumer can learn that before ``finalize``.
+
+    The consumer calls :func:`inspect_outcome` on EVERY completed process,
+    whatever its exit status, and treats a returned failure exactly like one
+    from ``classify_failure``. Implementations must tolerate any stdout (empty,
+    not JSON, truncated) and return ``None`` rather than raise; the conformance
+    kit probes that. A backend without the capability is unaffected: the base
+    ``AgentBackend`` protocol did not grow, which keeps this inside the freeze.
+    """
+
+    def inspect_outcome(self, outcome: RunOutcome, request: RunRequest) -> ClassifiedFailure | None:
+        """Return a failure the exit status could not reveal, else ``None``."""
+        ...
+
+
+def inspect_outcome(
+    backend: object, outcome: RunOutcome, request: RunRequest
+) -> ClassifiedFailure | None:
+    """Run the backend's :class:`OutcomeInspector` if it has one.
+
+    Returns ``None`` for a backend without the capability. Deliberately does
+    not look at the exit status: which processes get inspected is the
+    consumer's rule ("every completed one"), not this helper's.
+    """
+    if isinstance(backend, OutcomeInspector):
+        return backend.inspect_outcome(outcome, request)
+    return None
