@@ -18,6 +18,7 @@ from pontonier.backend.protocol import (
     OutcomeInspector,
     RunOutcome,
     RunRequest,
+    Usage,
     inspect_outcome,
 )
 from test_conformance_fakes import ClaudeLikeBackend, CodexLikeBackend
@@ -38,6 +39,7 @@ class EnvelopeInspectingBackend(ClaudeLikeBackend):
                 code="nonzero_exit",
                 detail=str(envelope.get("result", ""))[:80],
                 retryable=False,
+                usage=Usage(cost_usd=envelope.get("total_cost_usd")),
             )
         return None
 
@@ -59,13 +61,15 @@ def test_inspector_is_detected_structurally():
 
 def test_inspector_flags_a_zero_exit_error_envelope():
     backend = EnvelopeInspectingBackend()
-    stdout = json.dumps({"is_error": True, "result": "budget exceeded"})
+    stdout = json.dumps({"is_error": True, "result": "budget exceeded", "total_cost_usd": 0.12})
     outcome = RunOutcome(run=make_run(stdout=stdout, exit_code=0))
     failure = inspect_outcome(backend, outcome, REQUEST)
     assert failure is not None
     assert failure.code == "nonzero_exit"
     assert failure.detail == "budget exceeded"
     assert failure.retryable is False
+    assert failure.usage is not None
+    assert failure.usage.cost_usd == 0.12
 
 
 def test_inspector_passes_a_clean_envelope():

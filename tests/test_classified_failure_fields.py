@@ -13,7 +13,13 @@ import pytest
 
 from conftest import make_run
 from pontonier.backend import CONTRACT_API_VERSION, classify
-from pontonier.backend.protocol import ClassifiedFailure, RepairHint, RunOutcome, RunRequest
+from pontonier.backend.protocol import (
+    ClassifiedFailure,
+    RepairHint,
+    RunOutcome,
+    RunRequest,
+    Usage,
+)
 from test_contract import make_contract
 
 CONTRACT = make_contract()
@@ -25,6 +31,7 @@ def test_new_fields_default_to_none_and_keep_the_freeze():
     assert failure.retryable is None
     assert failure.details is None
     assert failure.repair is None
+    assert failure.usage is None
     assert CONTRACT_API_VERSION == 1
 
 
@@ -32,7 +39,15 @@ def test_positional_construction_is_unchanged():
     failure = ClassifiedFailure("nonzero_exit", "d", 250)
     assert (failure.code, failure.detail, failure.retry_after_ms) == ("nonzero_exit", "d", 250)
     names = [f.name for f in dataclasses.fields(ClassifiedFailure)]
-    assert names == ["code", "detail", "retry_after_ms", "retryable", "details", "repair"]
+    assert names == [
+        "code",
+        "detail",
+        "retry_after_ms",
+        "retryable",
+        "details",
+        "repair",
+        "usage",
+    ]
 
 
 def test_repair_hint_is_a_frozen_next_action():
@@ -71,3 +86,10 @@ def test_backend_hook_result_passes_through_untouched():
         CONTRACT, outcome, REQUEST, detail="detail", backend_hook=lambda _o, _r: populated
     )
     assert result is populated
+
+
+def test_usage_rides_a_failure():
+    # A zero-exit error envelope still reports what the run cost; the field keeps it.
+    failure = ClassifiedFailure(code="nonzero_exit", detail="d", usage=Usage(cost_usd=0.42))
+    assert failure.usage is not None
+    assert failure.usage.cost_usd == 0.42

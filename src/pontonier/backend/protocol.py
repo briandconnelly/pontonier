@@ -178,6 +178,12 @@ class ClassifiedFailure:
     defaults — it is never a claim. The shared skeleton in ``classify`` leaves
     all three ``None``. ``details`` is the envelope's field-detail object
     (``{field, value, reason}``), redacted by the backend before it lands here.
+
+    ``usage`` (0.9.0) carries whatever accounting the backend could still
+    extract from a failed run — Claude's zero-exit error envelope reports
+    ``total_cost_usd`` beside ``is_error`` — so a consumer that short-circuits
+    to its error path keeps the spend it observed. ``None`` means no
+    accounting was recoverable, not that the run was free.
     """
 
     code: str
@@ -186,6 +192,7 @@ class ClassifiedFailure:
     retryable: bool | None = None
     details: dict[str, Any] | None = None
     repair: RepairHint | None = None
+    usage: Usage | None = None
 
 
 @runtime_checkable
@@ -245,7 +252,12 @@ class OutcomeInspector(Protocol):
     whatever its exit status, and treats a returned failure exactly like one
     from ``classify_failure``. Implementations must tolerate any stdout (empty,
     not JSON, truncated) and return ``None`` rather than raise; the conformance
-    kit probes that. A backend without the capability is unaffected: the base
+    kit probes that.
+
+    A failure it returns may carry ``usage`` so the consumer keeps the spend
+    recorded in the same envelope that reported the error.
+
+    A backend without the capability is unaffected: the base
     ``AgentBackend`` protocol did not grow, which keeps this inside the freeze.
     """
 
@@ -262,6 +274,15 @@ def inspect_outcome(
     Returns ``None`` for a backend without the capability. Deliberately does
     not look at the exit status: which processes get inspected is the
     consumer's rule ("every completed one"), not this helper's.
+
+    Dispatch is structural presence only: ``isinstance`` checks that an
+    attribute named ``inspect_outcome`` exists, not that it is callable with
+    this arity; ``testing.conformance.check_backend`` reports a backend that
+    raises here. The helper shares the Protocol method's name on purpose (one
+    vocabulary), which sets one trap: inside an adapter's own
+    ``inspect_outcome`` method the bare name resolves to THIS function, so an
+    adapter must never call ``inspect_outcome(self, ...)`` from that method —
+    it recurses.
     """
     if isinstance(backend, OutcomeInspector):
         return backend.inspect_outcome(outcome, request)
