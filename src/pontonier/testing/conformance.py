@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pontonier.backend.protocol import AgentBackend, RunRequest
+from pontonier.backend.protocol import (
+    AgentBackend,
+    ClassifiedFailure,
+    OutcomeInspector,
+    RunOutcome,
+    RunRequest,
+)
+from pontonier.core.runtime import CommandRun
 from pontonier.testing.surface_honesty import find_contract_self_contradictions
 
 if TYPE_CHECKING:
@@ -72,4 +79,25 @@ def check_backend(contract: BackendContract, backend: object) -> list[str]:
                 "validate_request accepted a bogus reasoning_effort — pre-spend "
                 "validation is mandatory for this backend"
             )
+
+    if isinstance(backend, OutcomeInspector):
+        # The inspector runs on EVERY completed process, including ones whose
+        # stdout is empty or not JSON. One that raises there turns a classifiable
+        # run into a consumer crash, so tolerance is the invariant, not accuracy.
+        probe = RunRequest(kind="consult", prompt="conformance probe", cwd=".", timeout_seconds=1)
+        for stdout in ("", "not json", "{"):
+            outcome = RunOutcome(run=CommandRun(stdout, "", 0, 1, False))
+            try:
+                result = backend.inspect_outcome(outcome, probe)
+            except Exception as exc:
+                out.append(
+                    f"inspect_outcome raised {type(exc).__name__} on stdout {stdout!r}; "
+                    "it must return None or a ClassifiedFailure"
+                )
+                continue
+            if result is not None and not isinstance(result, ClassifiedFailure):
+                out.append(
+                    f"inspect_outcome returned {type(result).__name__} on stdout "
+                    f"{stdout!r}; it must return None or a ClassifiedFailure"
+                )
     return out
