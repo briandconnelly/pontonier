@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pontonier.backend.protocol import AgentBackend, RunRequest
+from pontonier.backend.protocol import (
+    AgentBackend,
+    ClassifiedFailure,
+    OutcomeInspector,
+    RunOutcome,
+    RunRequest,
+)
+from pontonier.core.runtime import TIMED_OUT, CommandRun
 from pontonier.testing.surface_honesty import find_contract_self_contradictions
 
 if TYPE_CHECKING:
@@ -72,4 +79,41 @@ def check_backend(contract: BackendContract, backend: object) -> list[str]:
                 "validate_request accepted a bogus reasoning_effort — pre-spend "
                 "validation is mandatory for this backend"
             )
+
+    if isinstance(backend, OutcomeInspector):
+        # The inspector runs on EVERY completed process, including ones whose
+        # stdout is empty or not JSON. One that raises there turns a classifiable
+        # run into a consumer crash, so tolerance is the invariant, not accuracy.
+        probe = RunRequest(kind="consult", prompt="conformance probe", cwd=".", timeout_seconds=1)
+        # Each outcome carries nothing but the process result — no events, no
+        # artifact_texts — because that is what a consumer has when the process
+        # never produced them. Returning a ClassifiedFailure for these is fine;
+        # raising is the violation.
+        hostile = (
+            RunOutcome(run=CommandRun("", "", 0, 1, False)),
+            RunOutcome(run=CommandRun("not json", "", 0, 1, False)),
+            RunOutcome(run=CommandRun("{", "", 0, 1, False)),
+            # Timed out is still "completed"; this is the shape run_async returns.
+            RunOutcome(run=CommandRun("", TIMED_OUT, -9, 1, True)),
+        )
+        for outcome in hostile:
+            label = f"stdout {outcome.run.stdout!r}" + (
+                ", timed out" if outcome.run.timed_out else ""
+            )
+            try:
+                result = backend.inspect_outcome(outcome, probe)
+            except Exception as exc:
+                out.append(
+                    f"inspect_outcome raised {type(exc).__name__} on {label}; "
+                    "it must return None or a ClassifiedFailure"
+                )
+                continue
+            # Reachable only when a plugin violates its own annotation; a type
+            # checker may call this branch unreachable. Keep it — third-party
+            # plugins are exactly who this probe exists for.
+            if result is not None and not isinstance(result, ClassifiedFailure):
+                out.append(
+                    f"inspect_outcome returned {type(result).__name__} on {label}; "
+                    "it must return None or a ClassifiedFailure"
+                )
     return out
