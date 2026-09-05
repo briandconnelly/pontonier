@@ -16,7 +16,7 @@ from pontonier.backend.protocol import (
     RunOutcome,
     RunRequest,
 )
-from pontonier.core.runtime import CommandRun
+from pontonier.core.runtime import TIMED_OUT, CommandRun
 from pontonier.testing.surface_honesty import find_contract_self_contradictions
 
 if TYPE_CHECKING:
@@ -93,7 +93,8 @@ def check_backend(contract: BackendContract, backend: object) -> list[str]:
             RunOutcome(run=CommandRun("", "", 0, 1, False)),
             RunOutcome(run=CommandRun("not json", "", 0, 1, False)),
             RunOutcome(run=CommandRun("{", "", 0, 1, False)),
-            RunOutcome(run=CommandRun("", "", 124, 1, True)),  # timed out is still "completed"
+            # Timed out is still "completed"; this is the shape run_async returns.
+            RunOutcome(run=CommandRun("", TIMED_OUT, -9, 1, True)),
         )
         for outcome in hostile:
             label = f"stdout {outcome.run.stdout!r}" + (

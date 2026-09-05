@@ -20,6 +20,7 @@ from pontonier.backend.protocol import (
     RunRequest,
     Usage,
 )
+from pontonier.conventions.envelope import REPAIR_STEPS
 from test_contract import make_contract
 
 CONTRACT = make_contract()
@@ -51,10 +52,10 @@ def test_positional_construction_is_unchanged():
 
 
 def test_repair_hint_is_a_frozen_next_action():
-    hint = RepairHint(next_step="run_status")
+    hint = RepairHint(next_step="authenticate")
     assert (hint.tool, hint.arguments, hint.alternative) == (None, None, None)
     full = RepairHint(
-        next_step="run_status",
+        next_step="authenticate",
         tool="amicus_backends",
         arguments={"backend": "claude"},
         alternative="Run `claude /login` and retry.",
@@ -62,6 +63,15 @@ def test_repair_hint_is_a_frozen_next_action():
     assert full.arguments == {"backend": "claude"}
     with pytest.raises(dataclasses.FrozenInstanceError):
         full.next_step = "other"  # type: ignore[misc]
+
+
+def test_repair_hint_speaks_the_shared_repair_vocabulary():
+    # One vocabulary: a hint uses the same symbols RepairRule does, so a consumer
+    # whose serializer maps REPAIR_STEPS can never meet a step it has no wire value for.
+    for step in REPAIR_STEPS:
+        assert RepairHint(next_step=step).next_step == step
+    with pytest.raises(ValueError, match="unknown repair step 'raise_timeout'"):
+        RepairHint(next_step="raise_timeout")
 
 
 def test_shared_classifier_expresses_no_opinion():
@@ -79,7 +89,7 @@ def test_backend_hook_result_passes_through_untouched():
         detail="deadline",
         retryable=False,
         details={"field": "timeout_seconds", "reason": "exceeded"},
-        repair=RepairHint(next_step="raise_timeout", tool="amicus_consult"),
+        repair=RepairHint(next_step="correct_arguments", tool="amicus_consult"),
     )
     outcome = RunOutcome(run=make_run(exit_code=1, timed_out=True))
     result = classify.classify(

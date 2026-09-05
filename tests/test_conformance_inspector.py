@@ -1,7 +1,7 @@
 """``check_backend`` and the OutcomeInspector capability: an inspector runs on EVERY
 completed process, including ones whose stdout is empty or not JSON, so one that raises
-there turns a classifiable run into a consumer crash. The probe feeds three hostile
-stdouts and reports a raise or a wrong return type as a violation. Backends without the
+there turns a classifiable run into a consumer crash. The probe feeds four hostile
+outcomes and reports a raise or a wrong return type as a violation. Backends without the
 capability are untouched (issue #15 is about a self-disabling check; this one has no
 contract flag to disable it)."""
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 from pontonier.backend.protocol import ClassifiedFailure, RunOutcome, RunRequest
+from pontonier.core.runtime import TIMED_OUT
 from pontonier.testing import conformance
 from test_conformance_fakes import CLAUDE_CONTRACT, ClaudeLikeBackend
 
@@ -30,6 +31,17 @@ class RaisingInspector(ClaudeLikeBackend):
         return json.loads(outcome.run.stdout).get("is_error") and ClassifiedFailure(
             code="nonzero_exit", detail="error envelope"
         )
+
+
+class TimeoutBranchRaisingInspector(ClaudeLikeBackend):
+    """Tolerant everywhere except the timeout branch a real inspector has, which keys
+    on the sentinel ``run_async`` writes into stderr. The probe must present that
+    sentinel, or this raise passes conformance clean."""
+
+    def inspect_outcome(self, outcome: RunOutcome, request: RunRequest) -> ClassifiedFailure | None:
+        if outcome.run.stderr == TIMED_OUT or outcome.run.exit_code == -9:
+            raise RuntimeError("no envelope to read after a timeout")
+        return None
 
 
 class WrongTypeInspector(ClaudeLikeBackend):
@@ -59,6 +71,13 @@ def test_raising_inspector_is_a_violation():
     assert any("JSONDecodeError" in v for v in violations)
     assert len(violations) == 4
     assert any("timed out" in v for v in violations)
+
+
+def test_timed_out_probe_has_the_shape_run_async_returns():
+    violations = conformance.check_backend(CLAUDE_CONTRACT, TimeoutBranchRaisingInspector())
+    assert len(violations) == 1
+    assert "RuntimeError" in violations[0]
+    assert "timed out" in violations[0]
 
 
 def test_wrong_return_type_is_a_violation():
