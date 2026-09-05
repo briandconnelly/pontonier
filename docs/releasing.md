@@ -28,6 +28,9 @@ On a branch, in one commit:
 3. Run the reverse-dependency check: `scripts/check_consumers.sh`.
    It force-installs the built wheel into each consuming bridge and runs that bridge's
    suite, so a release candidate is proven against the real adapters, not only the fakes.
+   With no arguments it expects the three bridges checked out beside this repository
+   (`../codex-in-claude`, `../moonbridge`, `../claude-in-codex`); from any other layout,
+   pass the checkouts explicitly: `scripts/check_consumers.sh /path/to/bridge ...`.
    Record the result in the release PR description.
 4. Run the gate: `./scripts/check.sh`. `tests/test_version.py` pins the installed
    metadata to the `pyproject.toml` declaration, so a stale editable install fails here.
