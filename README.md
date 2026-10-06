@@ -1,5 +1,11 @@
 # pontonier
 
+> [!WARNING]
+> **Deprecated.** pontonier is superseded by [**amicus**](https://github.com/briandconnelly/amicus),
+> which replaces the three bridges below with one MCP server and carries its own copy of this
+> library's code. All three bridges are archived. **0.9.0 is the final release.** This repository
+> is archived: installed versions keep working, but get no fixes or releases.
+
 Pontonier is the shared core library for cross-model agent-bridge MCP servers. An
 agent bridge lets one agent harness call an agent that runs on a
 different model. Three bridges use this library:

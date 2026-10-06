@@ -1,7 +1,7 @@
 [project]
 name = "pontonier"
 version = "0.9.0"
-description = "Shared core library for cross-model agent-bridge MCP servers (codex-in-claude, moonbridge, claude-in-codex)"
+description = "Deprecated: superseded by amicus. Shared core library for cross-model agent-bridge MCP servers (codex-in-claude, moonbridge, claude-in-codex)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -10,7 +10,7 @@ authors = [
 ]
 keywords = ["agent-bridge", "mcp", "claude-code", "codex", "kimi", "worktree", "jobs"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 7 - Inactive",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",

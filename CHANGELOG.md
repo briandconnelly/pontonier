@@ -6,6 +6,17 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This file is decision history, not current policy. Rules that still bind live in
 [AGENTS.md](AGENTS.md) and the documents it links.
 
+## [Unreleased]
+
+### Deprecated
+
+- **pontonier is deprecated in favor of [amicus](https://github.com/briandconnelly/amicus),
+  and 0.9.0 is its final release.** amicus replaces the three bridges with one MCP server.
+  It copied this library at v0.9.0 and no longer depends on it. All three bridges are
+  archived, and each one's final release pins `pontonier==0.9.0`, so no consumer is waiting
+  on a fix here. The repository is archived. The README and the package metadata (classifier
+  `Development Status :: 7 - Inactive`) carry the notice.
+
 ## [0.9.0] — 2026-09-04
 
 ### Added
